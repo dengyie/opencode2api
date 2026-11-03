@@ -261,7 +261,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		if gateErr != nil {
 			if errors.Is(gateErr, errInflightBusy) {
 				w.Header().Set("Retry-After", "5")
-				wire.WriteError(w, external, http.StatusTooManyRequests, "gateway is at its concurrent inference limit; retry shortly", "rate_limit_error", "gateway_busy")
+				wire.WriteError(w, external, http.StatusTooManyRequests, "gateway is at its concurrent inference limit; retry shortly", "rate_limit_error", "")
 				g.logger.Warn("request rejected by the inflight gate", "component", "gateway", "event", "gateway_busy", "inflight", g.inflight.inflight.Load(), "queued", g.inflight.queued.Load(), "wait_seconds", g.inflight.wait.Seconds())
 				return
 			}
@@ -359,8 +359,11 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 					retryAfter = 1
 				}
 				w.Header().Set("Retry-After", fmt.Sprint(retryAfter))
-				wire.WriteError(w, external, http.StatusTooManyRequests, "all configured upstream keys are quota-cooled (free usage limit); the gateway probes the window every quota_probe_seconds", "insufficient_quota", "free_usage_limit")
-				g.logger.Warn("request rejected by the quota pre-check", "component", "gateway", "event", "quota_precheck_blocked", "request_id", ids.Request, "model", model, "tier", route.Tier, "retry_after", retryAfter)
+				// The OpenAI-canonical quota type (insufficient_quota) is what
+				// clients key their no-retry logic on; the event name carries
+				// the more specific code for operators.
+				wire.WriteError(w, external, http.StatusTooManyRequests, "all configured upstream keys are quota-cooled (free usage limit); the gateway probes the window every quota_probe_seconds", "insufficient_quota", ids.Request)
+				g.logger.Warn("request rejected by the quota pre-check", "component", "gateway", "event", "quota_precheck_blocked", "code", "free_usage_limit", "request_id", ids.Request, "model", model, "tier", route.Tier, "retry_after", retryAfter)
 				return
 			}
 		}

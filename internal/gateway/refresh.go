@@ -365,7 +365,9 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *upstreamN
 		g.syncProxyResult(refreshCtx, proxy, status, err)
 		cancel()
 		if err == nil {
-			nodes.MarkSuccess(node)
+			// A listing proves the key works but says nothing about the
+			// inference quota window; keep any quota state intact (v1.5.0).
+			nodes.MarkListingSuccess(node)
 			return models
 		}
 		nodes.MarkFailure(node, nil, err)

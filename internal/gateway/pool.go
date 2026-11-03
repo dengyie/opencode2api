@@ -863,6 +863,16 @@ func (p *upstreamNodes) MarkSuccess(node *upstreamNode) {
 	node.probeNextAt.Store(0)
 }
 
+// MarkListingSuccess records that a model-catalog listing succeeded through
+// this key. That proves the key and its proxy transport work, not that the
+// quota window reopened — listings answer 200 even while inference is
+// quota-walled — so the quota state (v1.5.0) is deliberately left alone and
+// only a real inference success or a quota probe clears it.
+func (p *upstreamNodes) MarkListingSuccess(node *upstreamNode) {
+	node.failures.Store(0)
+	node.cooldownUntil.Store(0)
+}
+
 // MarkFailure cools node down after an error or a 401, 403, 429 or 5xx
 // response; any other response leaves it untouched. The cooldown doubles with
 // each consecutive failure, from the base cooldown up to 8x, and an upstream

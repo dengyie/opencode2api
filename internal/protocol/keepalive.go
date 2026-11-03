@@ -90,8 +90,8 @@ func (s *streamSupervisor) run() {
 			}
 		}
 	}
-	if period < 500*time.Millisecond {
-		period = 500 * time.Millisecond
+	if period < 50*time.Millisecond {
+		period = 50 * time.Millisecond
 	}
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
@@ -123,7 +123,7 @@ func (s *streamSupervisor) run() {
 // that raced in are swallowed from here on, so nothing follows the error.
 func (s *streamSupervisor) fireIdle(silence time.Duration) {
 	s.idleFired.Store(true)
-	message := fmt.Sprintf("upstream stream produced no output for %s; the request was aborted instead of waiting out the budget on a wedged stream", silence.Round(time.Second))
+	message := fmt.Sprintf("upstream_idle_timeout: upstream stream produced no output for %s; the request was aborted instead of waiting out the budget on a wedged stream", silence.Round(time.Second))
 	_ = s.idleEmitter().Emit(bridgeStreamEvent{Kind: "error", Error: message, ErrorType: "upstream_error"})
 	if s.supervision.OnIdle != nil {
 		s.supervision.OnIdle(silence)
@@ -141,16 +141,28 @@ func (s *streamSupervisor) writeKeepalive() {
 	_ = s.writeFrame([]byte(frame))
 }
 
+// writeThrough writes data under the lock, flushes, and counts it as
+// downstream progress. bypassIdle lets the supervisor's own idle error frame
+// through after the watchdog fired; the data pump's writes set it false so
+// residual upstream bytes are swallowed and nothing follows the error frame.
+func (s *streamSupervisor) writeThrough(data []byte, bypassIdle bool) (int, error) {
+	if !bypassIdle && s.idleFired.Load() {
+		return len(data), nil
+	}
+	s.mu.Lock()
+	n, err := s.w.Write(data)
+	if n > 0 {
+		s.flusher.Flush()
+		s.lastWrite.Store(time.Now().UnixNano())
+	}
+	s.mu.Unlock()
+	return n, err
+}
+
 // writeFrame writes one self-contained SSE frame under the lock and flushes.
 func (s *streamSupervisor) writeFrame(frame []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.w.Write(frame); err != nil {
-		return err
-	}
-	s.flusher.Flush()
-	s.lastWrite.Store(time.Now().UnixNano())
-	return nil
+	_, err := s.writeThrough(frame, false)
+	return err
 }
 
 // supervisedWriter is the io.Writer the data pump writes through: every chunk
@@ -160,23 +172,21 @@ func (s *streamSupervisor) writeFrame(frame []byte) error {
 type supervisedWriter streamSupervisor
 
 func (s *supervisedWriter) Write(data []byte) (int, error) {
-	if s.idleFired.Load() {
-		return len(data), nil
-	}
-	s.mu.Lock()
-	n, err := s.w.Write(data)
-	if n > 0 {
-		s.flusher.Flush()
-	}
-	s.mu.Unlock()
-	if n > 0 {
-		s.lastWrite.Store(time.Now().UnixNano())
-	}
-	return n, err
+	return (*streamSupervisor)(s).writeThrough(data, false)
 }
 
 // Writer returns the io.Writer data pumps must use for downstream writes.
 func (s *streamSupervisor) Writer() io.Writer { return (*supervisedWriter)(s) }
+
+// supervisorFrameWriter is the io.Writer the supervisor's own idle error
+// frame goes through: identical to the pump writer except that the idle
+// swallow does not apply — without the bypass the error frame would swallow
+// itself, since idleFired is set before the frame is emitted.
+type supervisorFrameWriter struct{ s *streamSupervisor }
+
+func (w supervisorFrameWriter) Write(data []byte) (int, error) {
+	return w.s.writeThrough(data, true)
+}
 
 // MarkData records upstream output for the idle clock. Call it for every
 // upstream chunk, whether or not it produced a downstream write.
@@ -188,11 +198,12 @@ func (s *streamSupervisor) MarkData() { s.lastUpstream.Store(time.Now().UnixNano
 func (s *streamSupervisor) Stop() { s.stopOnce.Do(func() { close(s.stop) }) }
 
 // idleEmitter delivers the idle error in the downstream protocol. It builds a
-// fresh encoder writing through the supervisor's own writer, so the frame is
-// serialized and flushed like any other; a fresh encoder for a standalone
-// error event matches the established emitUnexpectedStreamError pattern.
+// fresh encoder writing through the supervisor's bypass writer, so the frame
+// is serialized like any other but survives the idle swallow; a fresh encoder
+// for a standalone error event matches the established
+// emitUnexpectedStreamError pattern.
 func (s *streamSupervisor) idleEmitter() *bridgeStreamEncoder {
-	return bridgeStreamEmitter(s.Writer(), s.flusher, s.protocol, s.model)
+	return bridgeStreamEmitter(supervisorFrameWriter{s}, s.flusher, s.protocol, s.model)
 }
 
 // markDataObserver wraps the usage observer so every upstream chunk read by
