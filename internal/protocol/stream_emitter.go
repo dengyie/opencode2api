@@ -710,13 +710,15 @@ func (emitter *bridgeStreamEncoder) sse(eventName string, value any) error {
 
 // rawSSE writes one SSE event and flushes it, so the client sees each event as
 // it is produced. An empty eventName omits the event line, as Chat streams do.
+// The whole frame is written with one Write call, so a supervised stream (see
+// keepalive.go) serializes complete events against keepalive frames instead of
+// splitting an event across two lock acquisitions.
 func (emitter *bridgeStreamEncoder) rawSSE(eventName, data string) error {
+	frame := "data: " + data + "\n\n"
 	if eventName != "" {
-		if _, err := fmt.Fprintf(emitter.w, "event: %s\n", eventName); err != nil {
-			return err
-		}
+		frame = "event: " + eventName + "\n" + frame
 	}
-	if _, err := fmt.Fprintf(emitter.w, "data: %s\n\n", data); err != nil {
+	if _, err := io.WriteString(emitter.w, frame); err != nil {
 		return err
 	}
 	emitter.flush.Flush()

@@ -56,13 +56,17 @@ func (e *ClientWriteError) Unwrap() error { return e.Err }
 // terminal event; a *ClientWriteError when writing to the client failed; the
 // error returned by ready; or whatever ended the read, errSSEUnexpectedEOF
 // included. A client cancellation does not get a synthetic error event.
-func RotationStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, alias string, ready func() error) (usage Usage, reported, committed bool, result error) {
+func RotationStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, alias string, ready func() error, supervision *StreamSupervision) (usage Usage, reported, committed bool, result error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return usage, false, false, fmt.Errorf("streaming is unsupported")
 	}
 	parser := streamUsageObserver(from).parser
 	emitter := bridgeStreamEmitter(w, flusher, to, alias)
+	// The keepalive/idle supervisor starts only once the attempt is committed:
+	// before that the gateway's own first-output timer governs, and a failure
+	// must stay rotatable instead of being pinned to this attempt.
+	var sup *streamSupervisor
 	pending := []bridgeStreamEvent{}
 	var upstreamFailure error
 	emit := func(event bridgeStreamEvent) error {
@@ -76,6 +80,9 @@ func RotationStream(ctx context.Context, w http.ResponseWriter, reader io.Reader
 		return nil
 	}
 	readErr := readSSE(reader, func(name, data string) error {
+		if sup != nil {
+			sup.MarkData()
+		}
 		events, err := parser.Parse(name, data)
 		if err != nil {
 			return &StreamFailure{Type: "parse_error"}
@@ -98,6 +105,15 @@ func RotationStream(ctx context.Context, w http.ResponseWriter, reader io.Reader
 					return err
 				}
 				committed = true
+				if sup == nil {
+					sup = startStreamSupervisor(ctx, w, flusher, to, alias, supervision)
+					if sup != nil {
+						// Defer at function scope: the loop stops when
+						// RotationStream returns, whatever ended the read.
+						defer sup.Stop()
+						emitter.w = sup.Writer()
+					}
+				}
 				for _, p := range pending {
 					if err := emit(p); err != nil {
 						return err

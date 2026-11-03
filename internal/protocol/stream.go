@@ -72,7 +72,10 @@ type bridgeStreamEvent struct {
 // A canceled client gets no synthetic upstream error event: the gateway
 // cancels the request context when the client goes away, and writing after
 // that only wastes the remaining attempt.
-func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) (Usage, bool, error) {
+//
+// A non-nil supervision installs the stream keepalive and the post-commit idle
+// watchdog on the committed stream; nil keeps the pre-v1.5 behavior.
+func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string, supervision *StreamSupervision) (Usage, bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
@@ -86,8 +89,18 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		responseReasoning: map[string]bool{},
 	}
 	emitter := bridgeStreamEmitter(w, flusher, to, model)
+	sup := startStreamSupervisor(ctx, w, flusher, to, model, supervision)
+	if sup != nil {
+		defer sup.Stop()
+		// Every downstream write of this stream, pump and background loop
+		// alike, goes through the supervised writer so frames cannot interleave.
+		emitter.w = sup.Writer()
+	}
 	termination := streamOpen
 	readErr := readSSE(reader, func(eventName, data string) error {
+		if sup != nil {
+			sup.MarkData()
+		}
 		events, err := parser.Parse(eventName, data)
 		if err != nil {
 			termination = streamErrorTermination
@@ -190,13 +203,26 @@ func (writer *sseFlushWriter) Write(data []byte) (int, error) {
 // upstream error event was relayed, the copy error, or the parse error (or
 // errSSEUnexpectedEOF) after an error event was emitted for a stream that
 // ended early. A canceled client gets no synthetic error event.
-func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string) (Usage, bool, error) {
+//
+// A non-nil supervision installs the stream keepalive and the post-commit idle
+// watchdog on the committed stream; nil keeps the pre-v1.5 behavior.
+func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string, supervision *StreamSupervision) (Usage, bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	observer := streamUsageObserver(protocol)
-	_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher}, io.TeeReader(reader, observer))
+	sup := startStreamSupervisor(ctx, w, flusher, protocol, model, supervision)
+	if sup != nil {
+		defer sup.Stop()
+	}
+	var src io.Reader = io.TeeReader(reader, observer)
+	var dst io.Writer = &sseFlushWriter{writer: w, flusher: flusher}
+	if sup != nil {
+		src = io.TeeReader(reader, &markDataObserver{inner: observer, sup: sup})
+		dst = sup.Writer()
+	}
+	_, copyErr := io.Copy(dst, src)
 	usage := observer.Finish()
 	if observer.ErrorTermination() {
 		if copyErr != nil {
@@ -220,7 +246,15 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	if cause == nil {
 		cause = errSSEUnexpectedEOF
 	}
-	emitter := bridgeStreamEmitter(w, flusher, protocol, model)
+	// Route the late error frame through the supervised writer when one is
+	// installed: the background loop may still be writing a keepalive frame
+	// until Stop takes effect, and the two must not interleave.
+	errW := io.Writer(w)
+	if sup != nil {
+		sup.Stop()
+		errW = sup.Writer()
+	}
+	emitter := bridgeStreamEmitter(errW, flusher, protocol, model)
 	if err := emitUnexpectedStreamError(emitter, cause); err != nil {
 		return usage, observer.Reported(), err
 	}

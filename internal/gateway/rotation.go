@@ -306,7 +306,17 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 			defer g.monitor.EndStream()
 		}
 		streamBody := wire.RenameStreamReader(resp.Body, route.Protocol, toolRenames)
-		usage, reported, committed, err := wire.RotationStream(original.Context(), w, streamBody, route.Protocol, external, alias, ready)
+		// The supervisor starts at commit inside RotationStream; OnIdle aborts
+		// this attempt's context so a wedged stream stops consuming the budget.
+		supervision := &wire.StreamSupervision{
+			Heartbeat: time.Duration(g.cfg.Performance.HeartbeatSeconds) * time.Second,
+			Idle:      time.Duration(g.cfg.Performance.IdleTimeoutSeconds) * time.Second,
+			OnIdle: func(silence time.Duration) {
+				g.logger.Warn("rotation stream went idle; aborted the attempt", "component", "stream", "event", "upstream_idle_timeout", "request_id", ids.Request, "alias", alias, "model", route.ID, "silence", silence.String())
+				cancel()
+			},
+		}
+		usage, reported, committed, err := wire.RotationStream(original.Context(), w, streamBody, route.Protocol, external, alias, ready, supervision)
 		if meta != nil {
 			meta.Usage = usage
 			meta.UsageReported = reported

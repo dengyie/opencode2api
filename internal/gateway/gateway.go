@@ -326,6 +326,18 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
+		// Stream supervision (v1.5.0): keepalive frames during upstream
+		// silence, and an idle watchdog that aborts a wedged stream instead of
+		// waiting out the request budget. Both disabled by their config being
+		// zero, which reproduces the pre-v1.5 behavior exactly.
+		supervision := &wire.StreamSupervision{
+			Heartbeat: time.Duration(g.cfg.Performance.HeartbeatSeconds) * time.Second,
+			Idle:      time.Duration(g.cfg.Performance.IdleTimeoutSeconds) * time.Second,
+			OnIdle: func(silence time.Duration) {
+				g.logger.Warn("upstream stream went idle; aborted the request", "component", "stream", "event", "upstream_idle_timeout", "request_id", ids.Request, "model", model, "tier", route.Tier, "silence", silence.String())
+				cancel()
+			},
+		}
 		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
 		if err != nil {
 			// The error branch never forwards the last response body, so close
@@ -421,9 +433,9 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			var usage wire.Usage
 			var usageReported bool
 			if external == upstreamRoute.Protocol {
-				usage, usageReported, err = wire.ForwardStream(r.Context(), w, streamBody, upstreamRoute.Protocol, model)
+				usage, usageReported, err = wire.ForwardStream(r.Context(), w, streamBody, upstreamRoute.Protocol, model, supervision)
 			} else {
-				usage, usageReported, err = wire.TranscodeStream(r.Context(), w, streamBody, upstreamRoute.Protocol, external, model)
+				usage, usageReported, err = wire.TranscodeStream(r.Context(), w, streamBody, upstreamRoute.Protocol, external, model, supervision)
 			}
 			if meta != nil {
 				meta.Usage, meta.UsageReported = usage, usageReported
