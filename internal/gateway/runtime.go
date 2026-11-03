@@ -67,6 +67,8 @@ type RuntimeController struct {
 	// availabilitySweep wakes the probe loop ahead of its minute tick; the
 	// capacity-one buffer coalesces requests while a sweep is in flight.
 	availabilitySweep chan struct{}
+	// quotaProbeCancel stops the quota probe loop (v1.5.0) at Shutdown.
+	quotaProbeCancel context.CancelFunc
 	// warpPool is the pool shared by successive runtimes when the WARP size
 	// and stack are unchanged. warpKey is the identity used for that reuse.
 	warpPool *warp.Pool
@@ -152,6 +154,9 @@ func RuntimeManager(root context.Context, configPath string, cfg config.Config, 
 	manager.start(runtime)
 	manager.metadata.Start(root)
 	manager.startAvailabilityChecks()
+	if cfg.Performance.QuotaProbeSeconds > 0 {
+		manager.startQuotaProbes()
+	}
 	return manager, nil
 }
 
@@ -446,6 +451,9 @@ func (m *RuntimeController) Reload() (ApplyResult, error) {
 func (m *RuntimeController) Shutdown() {
 	if m.availabilityCancel != nil {
 		m.availabilityCancel()
+	}
+	if m.quotaProbeCancel != nil {
+		m.quotaProbeCancel()
 	}
 	if current := m.current.Load(); current != nil {
 		current.cancel()

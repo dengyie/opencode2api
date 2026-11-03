@@ -603,6 +603,15 @@ type upstreamNode struct {
 	proxyIndex     atomic.Int64
 	failures       atomic.Uint32
 	cooldownUntil  atomic.Int64
+	// quotaUntil records when this key's quota window is believed to reopen
+	// after a 429 free-usage-limit style rejection (v1.5.0). It is a semantic
+	// superset of cooldownUntil: every quota-cooled key is also cooldown-
+	// cooled, but the probe loop and the quota pre-check read quotaUntil to
+	// tell "wait for the window" apart from an ordinary transport cooldown.
+	// probeNextAt is the earliest time the quota probe loop may test this key
+	// again with one minimal real request.
+	quotaUntil  atomic.Int64
+	probeNextAt atomic.Int64
 }
 
 // upstreamNodes is one tier's key pool. bindingsMu serializes rebinding and
@@ -615,6 +624,10 @@ type upstreamNodes struct {
 	cooldown     time.Duration
 	bindingsMu   sync.Mutex
 	bindingCount []int
+	// quotaProbeInterval paces how often the quota probe loop may test one
+	// quota-cooled key (v1.5.0). Zero disables quota marking and probing for
+	// the pool, keeping the pre-v1.5 behavior.
+	quotaProbeInterval time.Duration
 }
 
 // nodePool distributes keys over proxies in round-robin order. When there
@@ -846,16 +859,34 @@ func (c *nodeCursor) Next() *upstreamNode {
 func (p *upstreamNodes) MarkSuccess(node *upstreamNode) {
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	node.quotaUntil.Store(0)
+	node.probeNextAt.Store(0)
 }
 
 // MarkFailure cools node down after an error or a 401, 403, 429 or 5xx
 // response; any other response leaves it untouched. The cooldown doubles with
 // each consecutive failure, from the base cooldown up to 8x, and an upstream
-// Retry-After longer than that is honored in full.
+// Retry-After longer than that is honored in full. A 429 additionally marks
+// the key quota-cooled until the same instant, so the probe loop and the
+// quota pre-check can tell a spent quota window from an ordinary cooldown.
 func (p *upstreamNodes) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 		return
 	}
+	until := time.Now().Add(p.cooldownFor(node, resp, err))
+	node.cooldownUntil.Store(until.UnixNano())
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		node.quotaUntil.Store(until.UnixNano())
+		if p.quotaProbeInterval > 0 {
+			node.probeNextAt.Store(time.Now().Add(p.quotaProbeInterval).UnixNano())
+		}
+	}
+}
+
+// cooldownFor returns the cooldown MarkFailure would apply: the base cooldown
+// doubled per consecutive failure up to 8x, overridden by a longer upstream
+// Retry-After.
+func (p *upstreamNodes) cooldownFor(node *upstreamNode, resp *http.Response, err error) time.Duration {
 	failures := node.failures.Add(1)
 	multiplier := time.Duration(1 << min(failures-1, 3))
 	delay := p.cooldown * multiplier
@@ -864,7 +895,44 @@ func (p *upstreamNodes) MarkFailure(node *upstreamNode, resp *http.Response, err
 			delay = retryAfter
 		}
 	}
-	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
+	return delay
+}
+
+// QuotaCooledNodes returns the pool's keys that are currently quota-cooled.
+func (p *upstreamNodes) QuotaCooledNodes() []*upstreamNode {
+	if p == nil {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	var cooled []*upstreamNode
+	for _, node := range p.nodes {
+		if node.quotaUntil.Load() > now {
+			cooled = append(cooled, node)
+		}
+	}
+	return cooled
+}
+
+// AllQuotaCooled reports whether every key of this pool is quota-cooled and
+// when the first one reopens. A pool without keys, or with at least one
+// usable key, reports false. The quota pre-check uses this to reject a
+// request with zero upstream calls.
+func (p *upstreamNodes) AllQuotaCooled() (time.Time, bool) {
+	if p == nil || len(p.nodes) == 0 {
+		return time.Time{}, false
+	}
+	now := time.Now().UnixNano()
+	earliest := time.Time{}
+	for _, node := range p.nodes {
+		until := node.quotaUntil.Load()
+		if until <= now {
+			return time.Time{}, false
+		}
+		if earliest.IsZero() || until < earliest.UnixNano() {
+			earliest = time.Unix(0, until)
+		}
+	}
+	return earliest, true
 }
 
 // parseRetryAfter reads a Retry-After header in delta-seconds or HTTP-date

@@ -119,6 +119,10 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}
+	// v1.5.0: pace quota probes per key; zero keeps quota marking inert.
+	quotaProbeInterval := time.Duration(cfg.Performance.QuotaProbeSeconds) * time.Second
+	zenNodes.quotaProbeInterval = quotaProbeInterval
+	goNodes.quotaProbeInterval = quotaProbeInterval
 	catalog := models.Catalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
