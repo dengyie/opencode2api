@@ -248,6 +248,32 @@ type PerformanceConfig struct {
 	// abusive stays out of the anonymous cursor. Upstream does not publish
 	// the block duration, so the default is a conservative 15 minutes.
 	FreeTierBlockSeconds int `json:"free_tier_block_seconds"`
+	// HeartbeatSeconds is the downstream SSE keepalive threshold for committed
+	// streams: when the upstream has been silent this long, the gateway emits
+	// a client-invisible keepalive frame (an SSE comment line for Chat and
+	// Responses, a standard "event: ping" for Anthropic) so intermediaries and
+	// client idle watchdogs do not cut a thinking stream. 0 disables it.
+	HeartbeatSeconds int `json:"heartbeat_seconds"`
+	// IdleTimeoutSeconds is the post-commit stream idle watchdog. When the
+	// upstream has produced nothing for this long, the gateway emits an
+	// in-band error event (code upstream_idle_timeout), cancels the upstream
+	// request so no further tokens are burned, and ends the turn. 0 disables
+	// the watchdog and keeps the pre-v1.5 behavior of waiting out the whole
+	// request budget. It only matters when it is smaller than
+	// retry.timeout_seconds.
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+	// QuotaProbeSeconds is how often a key that is quota-cooled (429 free
+	// usage limit) may be probed with one minimal real request to learn
+	// whether its quota window has reopened; a success clears the cooldown
+	// immediately instead of waiting it out passively. 0 disables probing.
+	QuotaProbeSeconds int `json:"quota_probe_seconds"`
+	// MaxInflight bounds concurrent inference turns gateway-wide. Additional
+	// requests queue for up to QueueWaitSeconds and are then rejected with
+	// 429 gateway_busy. 0 disables admission control.
+	MaxInflight int `json:"max_inflight"`
+	// QueueWaitSeconds is how long a request waits for a free inflight slot
+	// when max_inflight is reached. 0 rejects immediately when full.
+	QueueWaitSeconds int `json:"queue_wait_seconds"`
 }
 
 // AttemptTimeout returns the bound for a single upstream attempt. When
@@ -295,7 +321,7 @@ func Load(path string) (Config, error) {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, HeartbeatSeconds: 15},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -384,6 +410,21 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.FreeTierBlockSeconds < 0 {
 		return Config{}, errors.New("performance.free_tier_block_seconds must not be negative (0 uses the built-in cool-down)")
+	}
+	if cfg.Performance.HeartbeatSeconds < 0 || cfg.Performance.HeartbeatSeconds > 86400 {
+		return Config{}, errors.New("performance.heartbeat_seconds must be between 0 and 86400 (0 disables the stream keepalive)")
+	}
+	if cfg.Performance.IdleTimeoutSeconds < 0 || cfg.Performance.IdleTimeoutSeconds > 86400 {
+		return Config{}, errors.New("performance.idle_timeout_seconds must be between 0 and 86400 (0 disables the idle watchdog)")
+	}
+	if cfg.Performance.QuotaProbeSeconds < 0 || cfg.Performance.QuotaProbeSeconds > 86400 {
+		return Config{}, errors.New("performance.quota_probe_seconds must be between 0 and 86400 (0 disables quota probing)")
+	}
+	if cfg.Performance.MaxInflight < 0 {
+		return Config{}, errors.New("performance.max_inflight must not be negative (0 disables the inflight gate)")
+	}
+	if cfg.Performance.QueueWaitSeconds < 0 || cfg.Performance.QueueWaitSeconds > 3600 {
+		return Config{}, errors.New("performance.queue_wait_seconds must be between 0 and 3600 (0 rejects immediately when full)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
