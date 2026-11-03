@@ -154,10 +154,23 @@ func RuntimeManager(root context.Context, configPath string, cfg config.Config, 
 	manager.start(runtime)
 	manager.metadata.Start(root)
 	manager.startAvailabilityChecks()
-	if cfg.Performance.QuotaProbeSeconds > 0 {
-		manager.startQuotaProbes()
-	}
+	manager.rearmQuotaProbes(cfg)
 	return manager, nil
+}
+
+// rearmQuotaProbes (re)starts the quota probe loop so changes to
+// performance.quota_probe_seconds take effect on config apply — including
+// enabling it after starting with the knob off — instead of requiring a
+// restart. Any previous loop is canceled first, so repeated applies never
+// stack loops.
+func (m *RuntimeController) rearmQuotaProbes(cfg config.Config) {
+	if m.quotaProbeCancel != nil {
+		m.quotaProbeCancel()
+		m.quotaProbeCancel = nil
+	}
+	if cfg.Performance.QuotaProbeSeconds > 0 {
+		m.startQuotaProbes()
+	}
 }
 
 // migrateAvailabilityPath moves the legacy 40-bit state file to its 64-bit
@@ -411,6 +424,7 @@ func (m *RuntimeController) applyLocked(candidate config.Config, persist bool) (
 	next.gateway.syncRotation()
 	m.start(next)
 	previous := m.current.Swap(next)
+	m.rearmQuotaProbes(normalized)
 	m.warpPool, m.warpKey = next.warpPool, next.warpKey
 	if previous != nil {
 		previous.cancel()

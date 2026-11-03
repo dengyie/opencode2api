@@ -291,17 +291,17 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			}
 			return resp, keyRoute, attempts, nil
 		}
-		if resp != nil {
-			if isGeoBlockResponse(resp.StatusCode, peekResponseBody(resp)) {
-				// Region availability is an egress property: another key on the
-				// same egress gets the same answer. Stop here and map it to a
-				// client-actionable 404 instead of a retryable 403 (v1.5.0).
-				g.logger.Warn("upstream does not offer the model in this region; not trying other lanes", "component", "upstream", "event", "geo_block_detected", "request_id", ids.Request, "attempts", attempts, "tier", keyRoute.Tier, "status", resp.StatusCode)
-				if lastResponse != nil {
-					httpx.DrainAndClose(lastResponse.Body)
-				}
-				return nil, keyRoute, attempts, errGeoBlocked
+		if errors.Is(err, errGeoBlocked) {
+			// The key lane classified the region rejection itself (v1.5.0):
+			// no other tier changes the egress, so map it to the
+			// client-actionable 404 here.
+			g.logger.Warn("upstream does not offer the model in this region; not trying other tiers", "component", "upstream", "event", "geo_block_detected", "request_id", ids.Request, "attempts", attempts, "tier", keyRoute.Tier)
+			if lastResponse != nil {
+				httpx.DrainAndClose(lastResponse.Body)
 			}
+			return nil, keyRoute, attempts, errGeoBlocked
+		}
+		if resp != nil {
 			if isDeterministicClientResponse(resp.StatusCode, peekResponseBody(resp)) {
 				// Same request-level rejection as on the anonymous lane: no
 				// other tier can fix it, so return it as is.
@@ -1013,6 +1013,14 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", proxyLabel, "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
+		}
+		// Region availability is an egress property (v1.5.0): rotating to the
+		// next key on the same egress repeats the same answer, so stop this
+		// tier here. The outer route loop maps errGeoBlocked to a
+		// client-actionable 404 and does not try other tiers either.
+		if resp != nil && isGeoBlockResponse(resp.StatusCode, peekResponseBody(resp)) {
+			g.logger.Warn("upstream does not offer the model in this region; stopping key rotation", "component", "upstream", "event", "geo_block_detected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
+			return nil, errGeoBlocked, attempts
 		}
 		// Request-shape errors are deterministic and must leave this tier without
 		// rotating through unrelated keys. The outer route may still try the next

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"opencode2api/internal/models"
+
 	"opencode2api/internal/config"
 )
 
@@ -21,16 +23,26 @@ import (
 // during upstream silence, idle watchdog aborting a wedged stream) and the
 // quota pre-check are observed on the client side of the wire.
 
-// fakeUpstream serves the two v2 shapes the gateway touches: GET /v1/models
-// for discovery and POST /v1/chat/completions for inference. The behavior
-// mode arrives in the model name: "test-free" streams one delta and wedges;
-// "test-quota" answers 429 with the free-usage-limit wording.
+// fakeUpstream serves the v2 shapes the gateway touches: GET /v1/models for
+// discovery, GET /capabilities for the protocol catalog (hermetic — without it
+// the gateway would fetch the real models.opencode.ai catalog, whose free
+// roster rotates), and POST /v1/chat/completions for inference. The behavior
+// mode arrives in the model name: "big-pickle" streams one delta and wedges;
+// "deepseek-v4.1-flash-free" is the probe's properly terminated stream;
+// "mimo-v2.6-flash-free" answers 429 with the free-usage-limit wording.
 func fakeUpstream(t *testing.T, wedged chan struct{}) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"id":"deepseek-v4.1-flash-free"},{"id":"big-pickle"},{"id":"mimo-v2.6-flash-free"}]}`))
+	})
+	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"opencode":{"id":"opencode","api":"https://opencode.ai/zen","npm":"@ai-sdk/openai-compatible","models":{` +
+			`"big-pickle":{"id":"big-pickle"},` +
+			`"deepseek-v4.1-flash-free":{"id":"deepseek-v4.1-flash-free"},` +
+			`"mimo-v2.6-flash-free":{"id":"mimo-v2.6-flash-free"}}}}`))
 	})
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		body := make([]byte, 4096)
@@ -95,6 +107,11 @@ func gatewayFor(t *testing.T, upstream, retryJSON, performanceJSON string) *Gate
 		t.Fatalf("config: %v", err)
 	}
 	cfg.Models.RefreshSeconds = 1
+	// Point the capability catalog at the fake before the refresh loop starts,
+	// so the E2E never touches the real models.opencode.ai.
+	origCapabilitiesURL := models.CapabilitiesURL
+	models.CapabilitiesURL = upstream + "/capabilities"
+	t.Cleanup(func() { models.CapabilitiesURL = origCapabilitiesURL })
 	g, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})), nil, nil)
 	if err != nil {
 		t.Fatalf("gateway: %v", err)
@@ -102,8 +119,6 @@ func gatewayFor(t *testing.T, upstream, retryJSON, performanceJSON string) *Gate
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	g.StartModelRefresh(ctx)
-	// Wait for the catalog to actually POPULATE (a permissive empty catalog
-	// supports everything, which would make the wait vacuous).
 	// Wait for the catalog to actually POPULATE (a permissive empty catalog
 	// supports everything, which would make the wait vacuous).
 	deadline := time.Now().Add(20 * time.Second)
@@ -252,6 +267,10 @@ func TestE2EQuotaProbeStillWalled(t *testing.T) {
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"id":"mimo-v2.6-flash-free"}]}`))
+	})
+	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"opencode":{"id":"opencode","api":"https://opencode.ai/zen","npm":"@ai-sdk/openai-compatible","models":{"mimo-v2.6-flash-free":{"id":"mimo-v2.6-flash-free"}}}}`))
 	})
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

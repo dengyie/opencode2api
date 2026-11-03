@@ -39,12 +39,12 @@ func testFlusher() http.Flusher { return httptest.NewRecorder() }
 func TestSupervisorChatKeepalive(t *testing.T) {
 	w := &captureWriter{}
 	sup := startStreamSupervisor(context.Background(), w, testFlusher(), Chat, "m", &StreamSupervision{
-		Heartbeat: 30 * time.Millisecond,
+		Heartbeat: 60 * time.Millisecond,
 	})
 	if sup == nil {
 		t.Fatal("supervisor should start")
 	}
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 	sup.Stop()
 	frames := w.all()
 	if len(frames) == 0 {
@@ -62,7 +62,7 @@ func TestSupervisorAnthropicKeepalive(t *testing.T) {
 	w := &captureWriter{}
 	sup := startStreamSupervisor(context.Background(), w, testFlusher(), Anthropic, "m", &StreamSupervision{Heartbeat: 30 * time.Millisecond})
 	defer sup.Stop()
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	if !strings.Contains(w.joined(), "event: ping") || !strings.Contains(w.joined(), `"type":"ping"`) {
 		t.Fatalf("anthropic keepalive must be event: ping, got %q", w.joined())
 	}
@@ -74,7 +74,7 @@ func TestSupervisorNoKeepaliveWhileWriting(t *testing.T) {
 	w := &captureWriter{}
 	sup := startStreamSupervisor(context.Background(), w, testFlusher(), Chat, "m", &StreamSupervision{Heartbeat: 30 * time.Millisecond})
 	defer sup.Stop()
-	deadline := time.Now().Add(150 * time.Millisecond)
+	deadline := time.Now().Add(400 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if _, err := sup.Writer().Write([]byte("data: x\n\n")); err != nil {
 			t.Fatal(err)
@@ -119,14 +119,14 @@ func TestSupervisorIdleDefersOnData(t *testing.T) {
 	w := &captureWriter{}
 	fired := make(chan struct{}, 1)
 	sup := startStreamSupervisor(context.Background(), w, testFlusher(), Chat, "m", &StreamSupervision{
-		Idle:   60 * time.Millisecond,
+		Idle:   150 * time.Millisecond,
 		OnIdle: func(time.Duration) { fired <- struct{}{} },
 	})
 	defer sup.Stop()
-	deadline := time.Now().Add(150 * time.Millisecond)
+	deadline := time.Now().Add(400 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		sup.MarkData()
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	select {
 	case <-fired:
@@ -149,7 +149,7 @@ func TestSupervisorDisabled(t *testing.T) {
 // every captured frame is a complete SSE unit.
 func TestSupervisorFramesStayAtomic(t *testing.T) {
 	w := &captureWriter{}
-	sup := startStreamSupervisor(context.Background(), w, testFlusher(), Chat, "m", &StreamSupervision{Heartbeat: 5 * time.Millisecond})
+	sup := startStreamSupervisor(context.Background(), w, testFlusher(), Chat, "m", &StreamSupervision{Heartbeat: 10 * time.Millisecond})
 	defer sup.Stop()
 	done := make(chan struct{})
 	go func() {

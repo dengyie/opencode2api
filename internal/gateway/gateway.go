@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/config"
@@ -165,12 +166,35 @@ func anonymousBackoffFromConfig(cfg *config.AnonymousBackoffConfig) anonymousBac
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", g.authenticate(g.handleModels))
-	mux.HandleFunc("POST /v1/chat/completions", g.authenticate(g.handleInference(wire.Chat)))
-	mux.HandleFunc("POST /v1/responses", g.authenticate(g.handleInference(wire.Responses)))
-	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(wire.Anthropic)))
-	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
+	mux.HandleFunc("POST /v1/chat/completions", g.authenticate(g.gated(wire.Chat, g.handleInference(wire.Chat))))
+	mux.HandleFunc("POST /v1/responses", g.authenticate(g.gated(wire.Responses, g.handleInference(wire.Responses))))
+	mux.HandleFunc("POST /v1/messages", g.authenticate(g.gated(wire.Anthropic, g.handleInference(wire.Anthropic))))
+	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.gated(wire.SystemOne, g.handleSystemOne)))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
+}
+
+// gated admits a request through the inflight gate (v1.5.0) for the whole
+// turn. It wraps every inference endpoint — the three message handlers and
+// the dedicated /v1/systemone handler, which does not run through
+// handleInference — so max_inflight bounds them all uniformly. Disabled
+// unless performance.max_inflight is configured.
+func (g *Gateway) gated(protocol wire.Protocol, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		release, gateErr := g.inflight.acquire(r.Context())
+		if gateErr != nil {
+			if errors.Is(gateErr, errInflightBusy) {
+				w.Header().Set("Retry-After", "5")
+				wire.WriteError(w, protocol, http.StatusTooManyRequests, "gateway is at its concurrent inference limit; retry shortly", "rate_limit_error", "")
+				g.logger.Warn("request rejected by the inflight gate", "component", "gateway", "event", "gateway_busy", "inflight", g.inflight.inflight.Load(), "queued", g.inflight.queued.Load(), "wait_seconds", g.inflight.wait.Seconds())
+				return
+			}
+			wire.WriteError(w, protocol, statusClientClosedRequest, "request canceled while waiting for a free slot", "client_canceled", "")
+			return
+		}
+		defer release()
+		next(w, r)
+	}
 }
 
 // authenticate admits a request whose x-api-key header or Bearer token
@@ -254,21 +278,8 @@ func requestShapeFrom(ctx context.Context) requestShape {
 
 func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Inflight gate (v1.5.0): admission control over whole turns, covering
-		// the rotation and SystemOne branches below as well. Disabled unless
-		// performance.max_inflight is configured.
-		release, gateErr := g.inflight.acquire(r.Context())
-		if gateErr != nil {
-			if errors.Is(gateErr, errInflightBusy) {
-				w.Header().Set("Retry-After", "5")
-				wire.WriteError(w, external, http.StatusTooManyRequests, "gateway is at its concurrent inference limit; retry shortly", "rate_limit_error", "")
-				g.logger.Warn("request rejected by the inflight gate", "component", "gateway", "event", "gateway_busy", "inflight", g.inflight.inflight.Load(), "queued", g.inflight.queued.Load(), "wait_seconds", g.inflight.wait.Seconds())
-				return
-			}
-			wire.WriteError(w, external, statusClientClosedRequest, "request canceled while waiting for a free slot", "client_canceled", "")
-			return
-		}
-		defer release()
+		// Admission control lives in g.gated at the Handler() registration, so
+		// the dedicated /v1/systemone endpoint is bounded by the same gate.
 		r = r.WithContext(context.WithValue(r.Context(), requestShapeContextKey{}, &requestShape{}))
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 		if err != nil {
@@ -373,12 +384,17 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		// Stream supervision (v1.5.0): keepalive frames during upstream
 		// silence, and an idle watchdog that aborts a wedged stream instead of
 		// waiting out the request budget. Both disabled by their config being
-		// zero, which reproduces the pre-v1.5 behavior exactly.
+		// zero, which reproduces the pre-v1.5 behavior exactly. The flag
+		// separates "the watchdog aborted this stream" from "the client went
+		// away": both surface as context.Canceled on the upstream read, and
+		// without it the telemetry would blame the client.
+		var idleAborted atomic.Bool
 		supervision := &wire.StreamSupervision{
 			Heartbeat: time.Duration(g.cfg.Performance.HeartbeatSeconds) * time.Second,
 			Idle:      time.Duration(g.cfg.Performance.IdleTimeoutSeconds) * time.Second,
 			OnIdle: func(silence time.Duration) {
 				g.logger.Warn("upstream stream went idle; aborted the request", "component", "stream", "event", "upstream_idle_timeout", "request_id", ids.Request, "model", model, "tier", route.Tier, "silence", silence.String())
+				idleAborted.Store(true)
 				cancel()
 			},
 		}
@@ -493,7 +509,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				meta.Usage, meta.UsageReported = usage, usageReported
 				if err != nil {
 					meta.Outcome = "stream_error"
-					if wire.ClientCanceled(r.Context(), err) {
+					// The idle watchdog's cancel surfaces as context.Canceled
+					// too; check it first so a gateway-initiated abort is not
+					// billed as a client cancel.
+					if idleAborted.Load() {
+						meta.Outcome = "upstream_idle_timeout"
+					} else if wire.ClientCanceled(r.Context(), err) {
 						meta.Outcome = "client_canceled"
 					}
 				}

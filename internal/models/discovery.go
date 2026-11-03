@@ -17,13 +17,15 @@ import (
 
 // CapabilitiesURL is OpenCode's machine-readable model catalog. It feeds
 // FetchCapabilities and is also the OpenCode metadata endpoint the
-// PricingRegistry reads. ZenDocsURL and GoDocsURL are the Zen and Go
-// documentation pages whose endpoint tables FetchCapabilities reads with
-// FetchProtocolDocs.
+// PricingRegistry reads. It is a package variable so tests can point it at a
+// local fake and stay hermetic; production code must not reassign it. (The
+// PricingRegistry snapshots the value at package init, which is fine: tests
+// that swap the variable do not run the metadata registry.)
+var CapabilitiesURL = "https://models.opencode.ai/api.json"
+
 const (
-	CapabilitiesURL = "https://models.opencode.ai/api.json"
-	ZenDocsURL      = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx"
-	GoDocsURL       = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
+	ZenDocsURL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx"
+	GoDocsURL  = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
 	// V1Base is the v1 lane's origin: the /zen console (serving /zen/v1/*) that
 	// expects the OpenCode 1.x request shape. It is the default keyed Zen
 	// upstream and the anonymous lane's fallback after the v2 /inference

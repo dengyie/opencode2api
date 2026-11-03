@@ -4,6 +4,40 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.5.1 (2026-11-04) — post-review hardening
+
+Findings from the production code review of v1.5.0, all resolved.
+
+### Fixed
+
+- **Admission control now covers the dedicated `/v1/systemone` endpoint.** The
+  inflight gate moved into a `gated` wrapper applied to all four POST
+  endpoints, so `max_inflight` bounds them uniformly (v1.5.0's gate lived
+  inside `handleInference` only, and the comment claiming SystemOne coverage
+  was wrong).
+- **GEO classification stops key rotation within a tier.** The check moved
+  down into `doKeyUpstream`'s attempt loop (returning `errGeoBlocked`), so a
+  region-blocked model no longer burns `max_attempts` keys on the same egress
+  before the 404 mapping; the now-dead tier-level GEO branch was removed.
+- **Quota probes leave through a WARP exit when the model's lane uses WARP**,
+  matching the live traffic path instead of measuring a different egress.
+- **The quota probe loop re-arms on every config apply**, so
+  `performance.quota_probe_seconds` is hot-reloadable (enabling it after
+  starting with the knob off no longer requires a restart; repeated applies
+  never stack loops).
+- **Idle-aborted streams record `upstream_idle_timeout` as the request
+  outcome** instead of being misattributed to `client_canceled` (both surface
+  as `context.Canceled` on the upstream read).
+- Stale comment: the keepalive tick floor is 50ms, not the documented 500ms.
+
+### Tests
+
+- **E2E is hermetic**: the fake upstream serves the capability catalog and
+  `models.CapabilitiesURL` is a package variable the tests point at it — the
+  suite no longer depends on `models.opencode.ai` (whose free roster rotates)
+  or on external network at all. Keepalive unit tests got wider timing
+  margins for slow CI runners.
+
 ## v1.5.0 (2026-11-04) — stability & quota governance enhancements
 
 Base: jasonxu114514/opencode2api v1.4.6 (58f5667). Design document:

@@ -20,14 +20,16 @@ import (
 	"opencode2api/internal/jsonutil"
 )
 
-// metadataDefaultURL is the OpenCode metadata endpoint, metadataRefresh the
-// interval between refreshes, metadataRetry the delay after a failed refresh,
-// and metadataTimeout the limit of one fetch.
+// metadataDefaultURL is the OpenCode metadata endpoint (the same catalog
+// CapabilitiesURL points at; read at use time so a test override applies),
+// metadataRefresh the interval between refreshes, metadataRetry the delay
+// after a failed refresh, and metadataTimeout the limit of one fetch.
+var metadataDefaultURL = CapabilitiesURL
+
 const (
-	metadataDefaultURL = CapabilitiesURL
-	metadataRefresh    = 24 * time.Hour
-	metadataRetry      = time.Minute
-	metadataTimeout    = 30 * time.Second
+	metadataRefresh = 24 * time.Hour
+	metadataRetry   = time.Minute
+	metadataTimeout = 30 * time.Second
 )
 
 // Price is the pricing and limit metadata of one model. A nil cost means the

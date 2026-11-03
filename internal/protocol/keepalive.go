@@ -79,7 +79,7 @@ func startStreamSupervisor(ctx context.Context, w io.Writer, flusher http.Flushe
 }
 
 // run ticks faster than the shortest configured threshold (bounded to
-// [500ms, 2s]) and fires the idle watchdog or a keepalive frame when the
+// [50ms, 2s]) and fires the idle watchdog or a keepalive frame when the
 // corresponding clock has run over.
 func (s *streamSupervisor) run() {
 	period := 2 * time.Second

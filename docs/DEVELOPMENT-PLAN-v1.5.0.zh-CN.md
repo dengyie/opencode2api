@@ -201,6 +201,10 @@ func probeQuotaKey(node)
   其它: probeNextAt = now + quotaProbeInterval（不因探针误伤冷却语义）
 ```
 - 探活结果**只影响该 node**；anonymous lane 不参与（它有自己的熔断 half-open）。
+- 出口选择对齐生产路径（v1.5.1）：`usesWARP(model, tier, false)` 为真时探针经 `overWARP`
+  走 WARP 出口，与 `probeFreeModel` 的 lane 构造一致。
+- 生命周期（v1.5.1）：循环由 `rearmQuotaProbes` 在启动与**每次 config apply** 时重挂
+  （先 cancel 旧循环，重复 apply 不叠环），`quota_probe_seconds` 因此可热重载。
 - `quotaProbeInterval = cfg.Performance.QuotaProbeSeconds`（默认 600，0=整个循环不启动）。
 
 **配置**：`performance.quota_probe_seconds`（int，默认 600，0=off）。
@@ -246,7 +250,9 @@ func (g *inflightGate) acquire(ctx context.Context) (release func(), err error)
   // 满 → select { slot / ctx.Done() / time.After(wait) → errBusy }
 errBusy → 429 {"type":"rate_limit_error","code":"gateway_busy"}, Retry-After: 5
 ```
-- **挂点**：`handleInference` 最前（认证之后、模型检查之前——并发闸保护一切上游资源）；
+- **挂点（v1.5.1 修订）**：`Gateway.gated(protocol, next)` 包装器应用于 Handler() 里全部四个
+  POST 端点（chat/completions、responses、messages、**专用 /v1/systemone**）——闸必须覆盖
+  不经过 `handleInference` 的 SystemOne 专用 handler，否则存在无界旁路；
   `release` 用 `defer` 挂满整个回合（含流式转发全程）。
 - 计数语义：inflight = 正在进行的推理回合（从拿到 slot 到回合结束），与传输层连接数无关。
 - **暴露**：WebUI/健康状态 JSON 增加 `inflight`、`queued` 两个字段（admin/server.go 状态端点，
@@ -265,9 +271,10 @@ var geoBlockPatterns = []string{
 }
 func isGeoBlock(status int, body []byte) bool   // 4xx 且 body 命中
 ```
-- `upstream.go` 尝试循环：GEO 命中 → 按 deterministic 处理（停止跨 key/跨 tier 重试），
-  与 `isDeterministicClientResponse` 同路径（abuse.go:126 的调用点，实现时把 GEO 并入该判定或
-  在其调用处并列检查）。
+- `upstream.go`（v1.5.1 修订：检查下沉到 `doKeyUpstream` 内层尝试循环，2xx 判定之后、
+  可重试分类之前）→ 命中即 `return nil, errGeoBlocked, attempts`，同 tier 的 key 轮换立即停止；
+  外层 tier 循环对 `errors.Is(err, errGeoBlocked)` 传播并映射 404（原 tier 级检查已删除，
+  内层拦截后不可达）。
 - 终态映射：404 + `code: "model_not_available_in_region"`、`type: "invalid_request_error"`
   （对齐 oc-free 语义；不用 403——403 在多数客户端语义里是"可重试的鉴权问题"）。
 - **不**调用 availability disable：GEO 是出口属性，WARP 出口切换后同一模型可能可用；

@@ -120,8 +120,14 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 	if nodes == g.goNodes {
 		baseURL = g.cfg.Upstream.Go
 	}
+	// Match the live traffic path: when this model's lane egresses over WARP,
+	// the probe must leave through a WARP exit too, or it measures a different
+	// egress than production and can be answered by the free tier's IP gate
+	// instead of the key's quota.
+	tier := tierOf(nodes, g)
+	overWARP := g.usesWARP(model, tier, false)
 	started := time.Now()
-	result := g.probeAttempt(ctx, g.inferenceClient(proxy, baseURL, model), baseURL, node.key, model, protocol, ids, "", false)
+	result := g.probeAttempt(ctx, g.inferenceClient(proxy, baseURL, model), baseURL, node.key, model, protocol, ids, "", overWARP)
 	if !result.attempted {
 		// No request reached the upstream (transport/proxy down): probe again
 		// next interval without changing any cooldown state.
@@ -130,15 +136,15 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 	}
 	if result.success {
 		nodes.MarkSuccess(node)
-		g.logger.Info("quota probe recovered a key", "component", "upstream", "event", "quota_probe_recovered", "tier", tierOf(nodes, g), "key_id", config.KeyDisplayID(node.key), "model", model, "probe_ms", time.Since(started).Milliseconds())
+		g.logger.Info("quota probe recovered a key", "component", "upstream", "event", "quota_probe_recovered", "tier", tier, "key_id", config.KeyDisplayID(node.key), "model", model, "probe_ms", time.Since(started).Milliseconds())
 		return
 	}
 	if result.reason == "http_429" {
 		// Still walled; the next probe is due after the interval. quotaUntil
 		// already reflects the last real Retry-After, so leave it alone.
-		g.logger.Info("quota probe still walled", "component", "upstream", "event", "quota_probe_still_walled", "tier", tierOf(nodes, g), "key_id", config.KeyDisplayID(node.key), "model", model)
+		g.logger.Info("quota probe still walled", "component", "upstream", "event", "quota_probe_still_walled", "tier", tier, "key_id", config.KeyDisplayID(node.key), "model", model)
 	} else {
-		g.logger.Debug("quota probe inconclusive", "component", "upstream", "event", "quota_probe_inconclusive", "tier", tierOf(nodes, g), "key_id", config.KeyDisplayID(node.key), "reason", result.reason)
+		g.logger.Debug("quota probe inconclusive", "component", "upstream", "event", "quota_probe_inconclusive", "tier", tier, "key_id", config.KeyDisplayID(node.key), "reason", result.reason)
 	}
 	reschedule()
 }

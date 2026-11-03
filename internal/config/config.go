@@ -266,6 +266,7 @@ type PerformanceConfig struct {
 	// usage limit) may be probed with one minimal real request to learn
 	// whether its quota window has reopened; a success clears the cooldown
 	// immediately instead of waiting it out passively. 0 disables probing.
+	// Hot-reloadable: the probe loop re-arms on every config apply.
 	QuotaProbeSeconds int `json:"quota_probe_seconds"`
 	// MaxInflight bounds concurrent inference turns gateway-wide. Additional
 	// requests queue for up to QueueWaitSeconds and are then rejected with
