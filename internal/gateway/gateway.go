@@ -93,6 +93,9 @@ type Gateway struct {
 	// freeTierBlock is how long an exit the free tier flagged stays out of the
 	// anonymous cursor. Zero uses freeTierBlockTTL.
 	freeTierBlock time.Duration
+	// inflight bounds concurrent inference turns (v1.5.0). Nil disables
+	// admission control entirely.
+	inflight *inflightGate
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -139,6 +142,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),
 		freeTierBlock:  time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
+		inflight:       newInflightGate(cfg.Performance.MaxInflight, cfg.Performance.QueueWaitSeconds),
 	}, nil
 }
 
@@ -250,6 +254,21 @@ func requestShapeFrom(ctx context.Context) requestShape {
 
 func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Inflight gate (v1.5.0): admission control over whole turns, covering
+		// the rotation and SystemOne branches below as well. Disabled unless
+		// performance.max_inflight is configured.
+		release, gateErr := g.inflight.acquire(r.Context())
+		if gateErr != nil {
+			if errors.Is(gateErr, errInflightBusy) {
+				w.Header().Set("Retry-After", "5")
+				wire.WriteError(w, external, http.StatusTooManyRequests, "gateway is at its concurrent inference limit; retry shortly", "rate_limit_error", "gateway_busy")
+				g.logger.Warn("request rejected by the inflight gate", "component", "gateway", "event", "gateway_busy", "inflight", g.inflight.inflight.Load(), "queued", g.inflight.queued.Load(), "wait_seconds", g.inflight.wait.Seconds())
+				return
+			}
+			wire.WriteError(w, external, statusClientClosedRequest, "request canceled while waiting for a free slot", "client_canceled", "")
+			return
+		}
+		defer release()
 		r = r.WithContext(context.WithValue(r.Context(), requestShapeContextKey{}, &requestShape{}))
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 		if err != nil {
@@ -326,6 +345,24 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		if meta != nil {
 			meta.Request = ids.Request
 			meta.Session = ids.Session
+		}
+		// Quota pre-check (v1.5.0): when every key lane this request could
+		// fall back to is quota-cooled and the anonymous lane cannot take it
+		// either, reject with zero upstream calls. A real request through a
+		// walled pool would burn its attempts learning what Retry-After
+		// already knows, and the 429 lets a fronting gateway degrade to the
+		// next channel immediately.
+		if !isDiagnosticRequest(r.Context()) {
+			if until, walled := g.quotaWallFor(route); walled {
+				retryAfter := int((time.Until(until) + time.Second - 1) / time.Second)
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				w.Header().Set("Retry-After", fmt.Sprint(retryAfter))
+				wire.WriteError(w, external, http.StatusTooManyRequests, "all configured upstream keys are quota-cooled (free usage limit); the gateway probes the window every quota_probe_seconds", "insufficient_quota", "free_usage_limit")
+				g.logger.Warn("request rejected by the quota pre-check", "component", "gateway", "event", "quota_precheck_blocked", "request_id", ids.Request, "model", model, "tier", route.Tier, "retry_after", retryAfter)
+				return
+			}
 		}
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)

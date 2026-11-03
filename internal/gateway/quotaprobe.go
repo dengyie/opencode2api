@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
+	models "opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
 )
 
@@ -152,3 +153,61 @@ func tierOf(nodes *upstreamNodes, g *Gateway) config.Tier {
 
 // quotaProbeInFlight ensures at most one quota probe runs gateway-wide.
 var quotaProbeInFlight atomic.Bool
+
+// anonymousLaneAvailable reports, read-only, whether the anonymous lane could
+// currently take a request: enabled and its breaker not open. It never arms
+// the breaker's half-open probe — AllowAttempt does that, and the pre-check
+// must stay side-effect free. WARP-backed anonymous traffic counts as
+// available here: its breaker is this same breaker.
+func (g *Gateway) anonymousLaneAvailable() bool {
+	if !g.cfg.Anonymous || g.anonymous == nil {
+		return false
+	}
+	if g.anonymous.backoff.threshold >= 1 {
+		if until := g.anonymous.breakerUntil.Load(); until != 0 && time.Now().UnixNano() < until {
+			return false
+		}
+	}
+	return true
+}
+
+// quotaWallFor reports whether the request's possible lanes are all
+// quota-cooled, and when the first key reopens. Conservative by design: it
+// fires only when EVERY configured key lane is fully walled AND the anonymous
+// lane cannot take the request (disabled, breaker open, or the route starts
+// there anyway). A lane that might still serve the model never pre-checks a
+// request away.
+func (g *Gateway) quotaWallFor(route models.Route) (time.Time, bool) {
+	if route.Anonymous || g.anonymousLaneAvailable() {
+		return time.Time{}, false
+	}
+	zenConfigured := len(g.cfg.ZenKeys) > 0
+	goConfigured := len(g.cfg.GoKeys) > 0
+	if !zenConfigured && !goConfigured {
+		return time.Time{}, false
+	}
+	walled := false
+	earliest := time.Time{}
+	if zenConfigured {
+		until, ok := g.zenNodes.AllQuotaCooled()
+		if !ok {
+			return time.Time{}, false
+		}
+		walled = true
+		earliest = until
+	}
+	if goConfigured {
+		until, ok := g.goNodes.AllQuotaCooled()
+		if !ok {
+			return time.Time{}, false
+		}
+		walled = true
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+	if !walled || earliest.IsZero() {
+		return time.Time{}, false
+	}
+	return earliest, true
+}

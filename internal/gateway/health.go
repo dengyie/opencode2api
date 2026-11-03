@@ -20,7 +20,18 @@ type healthResponse struct {
 	Keys    healthKeys    `json:"keys"`
 	Proxies healthProxies `json:"proxies"`
 	Warp    *healthWarp   `json:"warp,omitempty"`
-	Issues  []string      `json:"issues,omitempty"`
+	// Load reports the inflight gate's occupancy (v1.5.0). It is omitted when
+	// admission control is disabled so existing readiness consumers see the
+	// same document as before.
+	Load   *healthLoad `json:"load,omitempty"`
+	Issues []string    `json:"issues,omitempty"`
+}
+
+// healthLoad is the operator view of the inflight gate.
+type healthLoad struct {
+	Inflight int64 `json:"inflight"`
+	Limit    int   `json:"limit"`
+	Queued   int64 `json:"queued"`
 }
 
 type healthModels struct {
@@ -156,8 +167,22 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Unhealthy: proxyTotal - proxyHealthy,
 		},
 		Warp:   warpStatus,
+		Load:   g.healthLoad(),
 		Issues: issues,
 	})
+}
+
+// healthLoad snapshots the inflight gate, or nil when admission control is
+// disabled.
+func (g *Gateway) healthLoad() *healthLoad {
+	if g.inflight == nil {
+		return nil
+	}
+	return &healthLoad{
+		Inflight: g.inflight.inflight.Load(),
+		Limit:    cap(g.inflight.slots),
+		Queued:   g.inflight.queued.Load(),
+	}
 }
 
 func (g *Gateway) availableModels() ([]modelcatalog.Route, modelcatalog.CatalogSnapshot) {
