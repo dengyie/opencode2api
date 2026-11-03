@@ -6,6 +6,14 @@
 
 WebUI 内嵌在可执行文件中，运行服务无需 Node.js 或数据库。
 
+## 关于本仓库
+
+本仓库是 [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api)
+的维护增强版（基线 v1.4.6，GPL-3.0）。在上游功能之上，面向免费层生产运行补充：
+SSE 流式心跳、commit 后 idle 看门狗、冷却 key 的额度探活与配额预检、全局并发闸、
+GEO 拒绝分类。详见 [CHANGELOG.md](CHANGELOG.md) 与
+[docs/DEVELOPMENT-PLAN-v1.5.0.zh-CN.md](docs/DEVELOPMENT-PLAN-v1.5.0.zh-CN.md)。
+
 ## 功能
 
 - 三种推理协议之间的普通 JSON 响应与 SSE 流式转换。

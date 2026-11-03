@@ -6,6 +6,17 @@ A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Respo
 
 The executable includes the WebUI. Running the service requires no Node.js runtime or database.
 
+## About this repository
+
+This is dengyie's maintained edition of
+[jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api)
+(baseline v1.4.6, GPL-3.0). On top of the upstream feature set it adds
+production-hardening for free-tier operation: SSE stream keepalive, a
+post-commit idle watchdog, quota probes and a quota pre-check for cooled
+keys, a global inflight gate, and geo-block classification. See
+[CHANGELOG.md](CHANGELOG.md) and
+[docs/DEVELOPMENT-PLAN-v1.5.0.zh-CN.md](docs/DEVELOPMENT-PLAN-v1.5.0.zh-CN.md).
+
 ## Capabilities
 
 - JSON and SSE responses across all three inference protocols.
