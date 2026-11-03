@@ -136,6 +136,49 @@ func isDeterministicClientResponse(status int, body []byte) bool {
 	return false
 }
 
+// errGeoBlocked reports that the upstream does not offer the model in the
+// region the gateway egresses from (v1.5.0). The region is a property of the
+// egress, not of the request, the key or the credential, so no other key or
+// lane can serve it and retrying only spends attempts on the same answer.
+// The model is deliberately not marked unavailable: a different exit region
+// may serve it fine.
+var errGeoBlocked = errors.New("model not available in this egress region")
+
+// geoBlockedMessage is what a client receives for errGeoBlocked. It names the
+// cause and the one thing that can change it, instead of leaving a 403 that
+// reads like an authentication problem to retry against.
+const geoBlockedMessage = "the upstream does not offer this model in the region this gateway egresses from; egressing through another region (a different proxy or WARP exit) may make it available"
+
+// geoBlockMarkers are the region-availability wordings the upstream uses for
+// a model this egress may not call. Matched only on 4xx bodies; the wordings
+// are specific enough that a quota or shape rejection never trips them.
+var geoBlockMarkers = []string{
+	"not available in your country",
+	"not available in your region",
+	"unsupported country",
+	"unsupported region",
+	"region not supported",
+	"country not supported",
+	"not available in this country",
+	"not available in this region",
+}
+
+// isGeoBlockResponse reports whether status and body are a region
+// availability rejection. It identifies WHY a 4xx happened so the gateway can
+// answer 404 model_not_available_in_region instead of a retryable 403.
+func isGeoBlockResponse(status int, body []byte) bool {
+	if status < 400 || status > 499 {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	for _, marker := range geoBlockMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // replayBody returns a body that yields prefix and then the rest of original.
 func replayBody(prefix []byte, original io.ReadCloser) io.ReadCloser {
 	return &prefixBody{Reader: io.MultiReader(bytes.NewReader(prefix), original), closer: original}

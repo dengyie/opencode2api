@@ -292,6 +292,16 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			return resp, keyRoute, attempts, nil
 		}
 		if resp != nil {
+			if isGeoBlockResponse(resp.StatusCode, peekResponseBody(resp)) {
+				// Region availability is an egress property: another key on the
+				// same egress gets the same answer. Stop here and map it to a
+				// client-actionable 404 instead of a retryable 403 (v1.5.0).
+				g.logger.Warn("upstream does not offer the model in this region; not trying other lanes", "component", "upstream", "event", "geo_block_detected", "request_id", ids.Request, "attempts", attempts, "tier", keyRoute.Tier, "status", resp.StatusCode)
+				if lastResponse != nil {
+					httpx.DrainAndClose(lastResponse.Body)
+				}
+				return nil, keyRoute, attempts, errGeoBlocked
+			}
 			if isDeterministicClientResponse(resp.StatusCode, peekResponseBody(resp)) {
 				// Same request-level rejection as on the anonymous lane: no
 				// other tier can fix it, so return it as is.
@@ -375,6 +385,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// then reports errDeterministicClientRejection so the caller keeps this
 	// 4xx instead of replacing it with a later tier's answer.
 	halted := false
+	// geoHalted records a region-availability rejection (v1.5.0): like halted
+	// it stops the walk, but the caller maps it to a 404 instead of
+	// forwarding the upstream 4xx.
+	geoHalted := false
 	cursor := g.anonymous.CursorFor(ids.Session)
 	limit := min(g.anonymous.Len(), g.maxAnonymousExits())
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
@@ -484,6 +498,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				blocked = true
 				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())
 				break
+			} else if isGeoBlockResponse(resp.StatusCode, peekResponseBody(resp)) {
+				// Every exit this request can use leaves from the same region,
+				// so walking them repeats the same answer (v1.5.0).
+				lastErr = errGeoBlocked
+				geoHalted = true
+				g.logger.Warn("upstream does not offer the model in this region; not trying other exits", "component", "upstream", "event", "geo_block_detected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				break
 			} else if isDeterministicClientResponse(resp.StatusCode, peekResponseBody(resp)) {
 				// The request is too long, malformed, or otherwise invalid on
 				// every lane. Stop here and hand this 4xx to the client.
@@ -532,6 +553,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		// earlier exit: it is the error the client can act on, and forwarding
 		// the block instead would hide the real cause.
 		if halted {
+			if geoHalted {
+				return lastResponse, errGeoBlocked, attempts
+			}
 			return lastResponse, errDeterministicClientRejection, attempts
 		}
 		if blocked {

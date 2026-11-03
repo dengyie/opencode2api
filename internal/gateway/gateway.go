@@ -436,6 +436,14 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, http.StatusServiceUnavailable, freeTierBlockedMessage, "free_tier_ip_blocked", ids.Request)
 				return
 			}
+			// The upstream does not offer the model in this egress's region
+			// (v1.5.0). No key or lane changes the region, so answer 404 — a
+			// client-actionable "pick another model/exit" — instead of the
+			// upstream's retryable-looking 403.
+			if errors.Is(err, errGeoBlocked) {
+				wire.WriteError(w, external, http.StatusNotFound, geoBlockedMessage, "invalid_request_error", "model_not_available_in_region")
+				return
+			}
 			// The anonymous lane's circuit breaker is open. Report the pause
 			// distinctly so the operator does not look for a credential or a
 			// model problem in the upstream error.
