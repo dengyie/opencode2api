@@ -30,16 +30,29 @@ func fakeUpstream(t *testing.T, wedged chan struct{}) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":[{"id":"test-free"},{"id":"test-quota"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"id":"deepseek-v4.1-flash-free"},{"id":"big-pickle"},{"id":"mimo-v2.6-flash-free"}]}`))
 	})
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		body := make([]byte, 4096)
 		n, _ := r.Body.Read(body)
-		if strings.Contains(string(body[:n]), `"test-quota"`) {
+		payload := string(body[:n])
+		if strings.Contains(payload, `"mimo-v2.6-flash-free"`) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "3600")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"error":{"message":"Free usage limit reached","type":"upstream_error"}}`))
+			return
+		}
+		if strings.Contains(payload, `"deepseek-v4.1-flash-free"`) {
+			// The quota probe's model: a complete, properly terminated stream.
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			flusher := w.(http.Flusher)
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			flusher.Flush()
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -82,22 +95,26 @@ func gatewayFor(t *testing.T, upstream, retryJSON, performanceJSON string) *Gate
 		t.Fatalf("config: %v", err)
 	}
 	cfg.Models.RefreshSeconds = 1
-	g, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), nil, nil)
+	g, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})), nil, nil)
 	if err != nil {
 		t.Fatalf("gateway: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	g.StartModelRefresh(ctx)
-	deadline := time.Now().Add(10 * time.Second)
+	// Wait for the catalog to actually POPULATE (a permissive empty catalog
+	// supports everything, which would make the wait vacuous).
+	// Wait for the catalog to actually POPULATE (a permissive empty catalog
+	// supports everything, which would make the wait vacuous).
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if g.catalog.Supported("test-free") {
+		if len(g.catalog.List()) > 0 {
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
-	if !g.catalog.Supported("test-free") {
-		t.Fatal("catalog never learned the fake upstream model")
+	if len(g.catalog.List()) == 0 {
+		t.Fatal("catalog never populated")
 	}
 	return g
 }
@@ -134,7 +151,7 @@ func TestE2EKeepaliveAndIdleWatchdog(t *testing.T) {
 	wedged := make(chan struct{})
 	upstream := fakeUpstream(t, wedged)
 	g := gatewayFor(t, upstream.URL, `{"max_attempts": 1, "timeout_seconds": 30}`, `{"heartbeat_seconds": 1, "idle_timeout_seconds": 2}`)
-	body := chatStream(t, g.Handler(), "test-free")
+	body := chatStream(t, g.Handler(), "big-pickle")
 	if !strings.Contains(body, `"content":"hello"`) {
 		t.Fatalf("first delta missing: %q", body)
 	}
@@ -160,7 +177,7 @@ func TestE2ESupervisionDisabled(t *testing.T) {
 	upstream := fakeUpstream(t, nil)
 	g := gatewayFor(t, upstream.URL, `{"max_attempts": 1, "timeout_seconds": 2}`, `{"heartbeat_seconds": 0, "idle_timeout_seconds": 0}`)
 	done := make(chan string, 1)
-	go func() { done <- chatStream(t, g.Handler(), "test-free") }()
+	go func() { done <- chatStream(t, g.Handler(), "big-pickle") }()
 	select {
 	case body := <-done:
 		if strings.Contains(body, ": keepalive") {
@@ -182,7 +199,7 @@ func TestE2EQuotaPrecheck(t *testing.T) {
 	server := httptest.NewServer(g.Handler())
 	defer server.Close()
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions",
-		strings.NewReader(`{"model":"test-quota","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+		strings.NewReader(`{"model":"mimo-v2.6-flash-free","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("x-api-key", "sk-local")
 	resp, err := server.Client().Do(req)
 	if err != nil {
@@ -198,5 +215,62 @@ func TestE2EQuotaPrecheck(t *testing.T) {
 	raw, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(raw), "insufficient_quota") || !strings.Contains(string(raw), "quota-cooled") {
 		t.Fatalf("error body must carry the quota semantics: %q", string(raw))
+	}
+}
+
+// The quota probe loop end-to-end: a key marked quota-cooled by a 429 with a
+// long Retry-After is probed through its own key; the upstream answering 200
+// clears the cooldown immediately, so the key routes again.
+func TestE2EQuotaProbeRecoversKey(t *testing.T) {
+	upstream := fakeUpstream(t, nil)
+	g := gatewayFor(t, upstream.URL, `{"max_attempts": 1, "timeout_seconds": 30}`, `{"quota_probe_seconds": 1}`)
+	node := g.zenNodes.nodes[0]
+	g.zenNodes.MarkFailure(node, quotaResponse("3600"), nil)
+	if node.quotaUntil.Load() == 0 {
+		t.Fatal("precondition: key must be quota-cooled")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	g.probeQuotaKey(ctx, g.zenNodes, node)
+	if node.cooldownUntil.Load() != 0 || node.quotaUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
+		t.Fatalf("a successful probe must clear all cooldown state, got cooldown=%d quota=%d probeNext=%d",
+			node.cooldownUntil.Load(), node.quotaUntil.Load(), node.probeNextAt.Load())
+	}
+	// And the key is usable again: a live non-stream request through it gets
+	// the upstream's 200 instead of the wall.
+	body := chatStream(t, g.Handler(), "deepseek-v4.1-flash-free")
+	if !strings.Contains(body, `"content":"OK"`) {
+		t.Fatalf("recovered key must route live traffic, got %q", body)
+	}
+}
+
+// A probe against a still-walled upstream reschedules without clearing.
+func TestE2EQuotaProbeStillWalled(t *testing.T) {
+	// Every model this fake lists answers 429 with a long Retry-After, so the
+	// probe picks the walled model and must reschedule instead of clearing.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"mimo-v2.6-flash-free"}]}`))
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"Free usage limit reached","type":"upstream_error"}}`))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	g := gatewayFor(t, server.URL, `{"max_attempts": 1, "timeout_seconds": 30}`, `{"quota_probe_seconds": 1}`)
+	node := g.zenNodes.nodes[0]
+	g.zenNodes.MarkFailure(node, quotaResponse("3600"), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	g.probeQuotaKey(ctx, g.zenNodes, node)
+	if node.cooldownUntil.Load() == 0 || node.quotaUntil.Load() == 0 {
+		t.Fatal("a still-walled probe must leave cooldown state intact")
+	}
+	if time.Until(time.Unix(0, node.probeNextAt.Load())) <= 0 {
+		t.Fatal("a still-walled probe must reschedule the next probe")
 	}
 }

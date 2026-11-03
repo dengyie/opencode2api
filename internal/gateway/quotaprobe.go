@@ -26,7 +26,19 @@ func (m *RuntimeController) startQuotaProbes() {
 	ctx, cancel := context.WithCancel(m.root)
 	m.quotaProbeCancel = cancel
 	go func() {
-		ticker := time.NewTicker(time.Minute)
+		// Tick at half the configured probe interval (bounded to [1s, 1m]) so
+		// a due probe fires close to its time at any interval, and the test
+		// suite can exercise the loop without minute-scale sleeps.
+		period := time.Minute
+		if interval := m.quotaProbeIntervalForTick(); interval > 0 {
+			if half := interval / 2; half < period {
+				period = half
+			}
+		}
+		if period < time.Second {
+			period = time.Second
+		}
+		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 		for {
 			m.probeQuotaCooledKeys(ctx)
@@ -37,6 +49,16 @@ func (m *RuntimeController) startQuotaProbes() {
 			}
 		}
 	}()
+}
+
+// quotaProbeIntervalForTick reads the configured probe interval from the
+// current runtime; zero (disabled) means the loop should never have started.
+func (m *RuntimeController) quotaProbeIntervalForTick() time.Duration {
+	r := m.current.Load()
+	if r == nil || r.gateway == nil || r.gateway.cfg.Performance.QuotaProbeSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(r.gateway.cfg.Performance.QuotaProbeSeconds) * time.Second
 }
 
 // probeQuotaCooledKeys collects due quota-cooled keys and probes them one at
