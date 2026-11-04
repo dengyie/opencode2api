@@ -2,10 +2,22 @@ package gateway
 
 import (
 	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	wire "opencode2api/internal/protocol"
 )
+
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 // acquire returns immediately while slots are free.
 func TestInflightAcquireFreeSlot(t *testing.T) {
@@ -119,4 +131,51 @@ func TestInflightDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	release()
+}
+
+// The gated wrapper bounds every handler it wraps: a full gate answers 429
+// gateway_busy with Retry-After, and a freed slot passes through to the
+// handler. This is the regression guard for the /v1/systemone admission
+// bypass found in review — the wrapper is what the dedicated endpoint hangs
+// off, so it must reject on its own.
+func TestGatedWrapperBoundsHandler(t *testing.T) {
+	g := &Gateway{
+		logger:   testLogger(t),
+		inflight: newInflightGate(1, 0),
+	}
+	release, err := g.inflight.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := g.gated(wire.SystemOne, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("handler must not run while the gate is full")
+	})
+	rec := httptest.NewRecorder()
+	handler(rec, httptest.NewRequest(http.MethodPost, "/v1/systemone", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want 5", got)
+	}
+	// WriteError carries the taxonomy in the type field (no code field):
+	// the gateway_busy token lives in the structured log event.
+	if !strings.Contains(rec.Body.String(), "rate_limit_error") || !strings.Contains(rec.Body.String(), "concurrent inference limit") {
+		t.Fatalf("body must carry the busy semantics: %q", rec.Body.String())
+	}
+	// A freed slot lets a DIFFERENT handler run to completion (the busy-path
+	// handler above must never run in either call).
+	release()
+	passed := false
+	passthrough := g.gated(wire.SystemOne, func(w http.ResponseWriter, _ *http.Request) {
+		passed = true
+	})
+	rec = httptest.NewRecorder()
+	passthrough(rec, httptest.NewRequest(http.MethodPost, "/v1/systemone", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("passthrough status = %d, want 200", rec.Code)
+	}
+	if !passed {
+		t.Fatal("passthrough handler did not run with a free slot")
+	}
 }
