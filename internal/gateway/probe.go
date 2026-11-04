@@ -25,6 +25,12 @@ type probeResult struct {
 	success, attempted, effortRejected bool
 	reason, channel                    string
 	effort                             models.EffortProbe
+	// sawReasoning records whether the successful response actually carried
+	// a reasoning payload. The capability catalog's reasoning flag has been
+	// observed to mark every free model reasoning=true regardless of real
+	// behavior (crouton-alpha-free answers with none), so live observation
+	// is the only trustworthy signal for cheap-probe-model selection.
+	sawReasoning bool
 }
 
 // resolvedEffort returns the reasoning effort to force on a request for model:
@@ -169,6 +175,11 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		}
 		result = run("")
 		result.channel = lane.name
+		if result.success && result.attempted {
+			// Live observation overrides the capability catalog's reasoning
+			// flag (observed to be wrong for crouton-alpha-free, 2026-11-05).
+			g.noteReasoningObservation(model, result.sawReasoning)
+		}
 		if result.success && lane.name == "anonymous" {
 			// A successful anonymous probe proves the lane answers again;
 			// close the breaker so user traffic resumes immediately.
@@ -277,7 +288,11 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 	}
 	reader := io.LimitReader(resp.Body, 1<<20)
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") && protocol != wire.SystemOne {
-		_, err = wire.CollapseStream(reader, protocol, model)
+		var doc []byte
+		doc, err = wire.CollapseStream(reader, protocol, model)
+		if err == nil {
+			result.sawReasoning = wire.DetectReasoning(protocol, doc)
+		}
 	} else {
 		var document map[string]any
 		err = json.NewDecoder(reader).Decode(&document)
@@ -285,6 +300,7 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 			err = fmt.Errorf("upstream error envelope: %v", document["error"])
 		}
 		if err == nil {
+			result.sawReasoning = wire.DetectReasoning(protocol, mustJSON(document))
 			switch protocol {
 			case wire.SystemOne:
 				answer := jsonutil.MapAt(document, "answers", "arithmetic")
@@ -355,4 +371,16 @@ func isEffortRejection(status int, body string) bool {
 		}
 	}
 	return false
+}
+
+
+// mustJSON re-serializes a decoded document for the marker scan in
+// DetectReasoning; the input came straight from json.Decode so this cannot
+// fail in practice.
+func mustJSON(document map[string]any) []byte {
+	b, err := json.Marshal(document)
+	if err != nil {
+		return nil
+	}
+	return b
 }

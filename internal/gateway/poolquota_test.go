@@ -5,6 +5,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"opencode2api/internal/config"
+	models "opencode2api/internal/models"
+	wire "opencode2api/internal/protocol"
 )
 
 // testKeyPool builds a pool with n keys against a nil-transport-free stub.
@@ -210,5 +214,47 @@ func TestQuotaWallCoversAnonymousRoute(t *testing.T) {
 	g.observeAnonymousWall(http.StatusOK)
 	if _, walled := g.quotaWall(); walled {
 		t.Fatal("a 2xx observation must stand down the pre-check")
+	}
+}
+
+// Live observation overrides the capability catalog's reasoning flag: with
+// every free model flagged reasoning=true upstream, a model empirically
+// observed to answer without reasoning becomes the preferred probe target.
+func TestQuotaProbeModelPrefersObservedNonReasoning(t *testing.T) {
+	upstream := fakeUpstream(t, nil)
+	g := gatewayFor(t, upstream.URL, `{"max_attempts": 1, "timeout_seconds": 30}`, `{"quota_probe_seconds": 1}`)
+	g.catalog.ReplaceWithCapabilities(
+		[]string{"deepseek-v4.1-flash-free", "crouton-alpha-free"},
+		nil,
+		map[config.Tier]map[string]wire.Protocol{config.TierZen: {
+			"deepseek-v4.1-flash-free": wire.Chat,
+			"crouton-alpha-free":       wire.Chat,
+		}},
+		nil,
+		// Upstream marks BOTH reasoning=true (observed in production).
+		map[config.Tier]map[string]models.Metadata{config.TierZen: {
+			"deepseek-v4.1-flash-free": {Reasoning: true},
+			"crouton-alpha-free":       {Reasoning: true},
+		}},
+	)
+	// No observation yet: both are metadata-reasoning, so the fallback picks
+	// the alphabetically first free model.
+	model, _, ok := g.quotaProbeModel(true)
+	if !ok || model != "crouton-alpha-free" {
+		t.Fatalf("unobserved fallback = %q ok=%v, want crouton", model, ok)
+	}
+	// Live observation: crouton answers WITHOUT reasoning → the observed flag
+	// overrides the catalog and crouton becomes the pick.
+	g.noteReasoningObservation("crouton-alpha-free", false)
+	model, _, ok = g.quotaProbeModel(true)
+	if !ok || model != "crouton-alpha-free" {
+		t.Fatalf("observed-non-reasoning preference = %q ok=%v, want crouton", model, ok)
+	}
+	// The reverse observation excludes crouton entirely: the probe falls back
+	// to the other model despite its metadata claiming reasoning=true.
+	g.noteReasoningObservation("crouton-alpha-free", true)
+	model, _, ok = g.quotaProbeModel(true)
+	if !ok || model != "deepseek-v4.1-flash-free" {
+		t.Fatalf("crouton excluded by observation = %q ok=%v, want deepseek", model, ok)
 	}
 }

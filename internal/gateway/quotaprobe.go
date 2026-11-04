@@ -137,6 +137,9 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 	}
 	if result.success {
 		nodes.MarkSuccess(node)
+		// The probe itself is an observation of the model's real behavior:
+		// feed the reasoning-learning map (v1.5.4).
+		g.noteReasoningObservation(model, result.sawReasoning)
 		// The pool reopened: drop the empirical anonymous-wall signal so the
 		// pre-check stands down immediately instead of riding out its window.
 		g.anonWallCount.Store(0)
@@ -153,13 +156,24 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 	reschedule()
 }
 
+// noteReasoningObservation records live reasoning behavior for one model,
+// overriding the capability catalog's reasoning flag for probe-model
+// selection. In-memory by design: the hourly availability probe re-learns the
+// map within one cycle after a restart.
+func (g *Gateway) noteReasoningObservation(model string, sawReasoning bool) {
+	g.observedReasoning.Store(model, sawReasoning)
+}
+
 // quotaProbeModel picks the model a quota probe should use: the first model
 // the catalog considers free, supported and native on the key lane. A
 // non-reasoning model is preferred when one exists — production probes
 // (2026-11-05) showed a reasoning model spends part of its probe budget
-// thinking before answering, costing extra tokens and latency on every probe.
-// The quota that gates a key is not model-specific, so any free model works;
-// the first acceptable choice keeps consecutive probes comparable.
+// thinking before answering. Selection order: (1) models empirically observed
+// to answer WITHOUT reasoning (live observation overrides the catalog, which
+// has flagged every free model reasoning=true even for models that answer
+// with none), (2) models the catalog marks non-reasoning, (3) fallback to the
+// first acceptable free model. The quota that gates a key is not
+// model-specific, so any free model works.
 func (g *Gateway) quotaProbeModel(zen bool) (string, wire.Protocol, bool) {
 	tier := config.TierZen
 	if !zen {
@@ -175,6 +189,12 @@ func (g *Gateway) quotaProbeModel(zen bool) (string, wire.Protocol, bool) {
 		protocol, ok := d.NativeProtocols[tier]
 		if !ok {
 			continue
+		}
+		if observed, has := g.observedReasoning.Load(model); has {
+			if observed.(bool) {
+				continue // empirically a reasoning model: never probe with it
+			}
+			return model, protocol, true // empirically non-reasoning: best
 		}
 		if !g.catalog.MetadataForTier(model, tier).Reasoning {
 			return model, protocol, true

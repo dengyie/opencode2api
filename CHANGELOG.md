@@ -4,6 +4,31 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.5.4 (2026-11-05) — empirical reasoning observation
+
+Production verification of the capability catalog showed its `reasoning`
+flag cannot be trusted: every free model is flagged reasoning=true, while
+live probing proved crouton-alpha-free answers with zero reasoning payload.
+That left the v1.5.2 probe-model preference permanently dormant.
+
+### Added
+
+- **Live reasoning observation**: every successful availability/quota probe
+  and the models they serve record whether the response actually carried a
+  reasoning payload (`wire.DetectReasoning` marker scan on the collapsed
+  document, in-memory per model).
+- `quotaProbeModel` selection order is now: (1) models **empirically
+  observed** to answer without reasoning — overriding the catalog, (2) models
+  the catalog marks non-reasoning, (3) fallback. Models observed to reason
+  are skipped entirely. In-memory by design: the hourly availability probe
+  re-learns the map within one cycle after a restart.
+
+### Tests
+
+- `DetectReasoning` marker matrix across all three protocols; probe-model
+  selection ordering with observed overrides (fallback → observed pick →
+  observed exclusion).
+
 ## v1.5.3 (2026-11-05) — wall-aware quota pre-check
 
 From continued production testing of v1.5.2: the free-pool capability

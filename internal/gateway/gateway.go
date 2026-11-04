@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -104,6 +105,11 @@ type Gateway struct {
 	// disabled by missing anonymous_backoff config.
 	anonWallCount  atomic.Int32
 	anonWallLastAt atomic.Int64
+	// observedReasoning caches live reasoning behavior per model (v1.5.4):
+	// true = a response actually carried a reasoning payload, false = a
+	// response completed with none. Overrides the capability catalog's
+	// reasoning flag for probe-model selection.
+	observedReasoning sync.Map
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
