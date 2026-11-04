@@ -181,7 +181,7 @@ func (g *Gateway) Handler() http.Handler {
 // unless performance.max_inflight is configured.
 func (g *Gateway) gated(protocol wire.Protocol, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		release, gateErr := g.inflight.acquire(r.Context())
+		release, waited, gateErr := g.inflight.acquire(r.Context())
 		if gateErr != nil {
 			if errors.Is(gateErr, errInflightBusy) {
 				w.Header().Set("Retry-After", "5")
@@ -193,6 +193,11 @@ func (g *Gateway) gated(protocol wire.Protocol, next http.HandlerFunc) http.Hand
 			return
 		}
 		defer release()
+		if waited > 0 {
+			// Saturation happened: visible here in the request log, not only
+			// by polling healthz.load during a burst.
+			g.logger.Info("request waited for a free inflight slot", "component", "gateway", "event", "inflight_queued", "waited", waited.String(), "queued_total", g.inflight.queuedTotal.Load())
+		}
 		next(w, r)
 	}
 }

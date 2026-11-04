@@ -205,6 +205,8 @@ func probeQuotaKey(node)
   走 WARP 出口，与 `probeFreeModel` 的 lane 构造一致。
 - 生命周期（v1.5.1）：循环由 `rearmQuotaProbes` 在启动与**每次 config apply** 时重挂
   （先 cancel 旧循环，重复 apply 不叠环），`quota_probe_seconds` 因此可热重载。
+- 探针模型偏好非 reasoning（v1.5.2，生产实证：reasoning 探针把预算花在思考上）——
+  `quotaProbeModel` 按 `MetadataForTier(...).Reasoning` 跳过 reasoning 模型，无候选时回退首个 free 模型。
 - `quotaProbeInterval = cfg.Performance.QuotaProbeSeconds`（默认 600，0=整个循环不启动）。
 
 **配置**：`performance.quota_probe_seconds`（int，默认 600，0=off）。
@@ -229,6 +231,10 @@ if lane, until, ok := g.quotaWallFor(route); ok {     // route 涉及的所有 k
   全部命中才预检。**anonymous lane 不纳入**（有自己的熔断）。
 - **旁路**：probe / Playground 身份（v1.4.6 已有 `probeRequestIDs` 身份分离，#162）直接跳过预检，
   保证管理面探活永远可达。
+- **前置条件（v1.5.2 生产实证补充）**：预检要求匿名道不可用（关闭/熔断开启）。若部署启用匿名道
+  但未配置 `models.anonymous_backoff`，上游语义下熔断器是**关闭**的（threshold<1 恒放行），
+  预检因此整墙期不触发——2026-11-05 tebi 墙期 `quota_precheck_blocked` 零事件实证。
+  运营若要墙期零上游拒绝，需同时配置 `anonymous_backoff` 启用熔断。
 - 与 New-API 的配合：429 + Retry-After 让渠道层毫秒级降级到 P5 商业渠道（tebi 10-28 已验证的行为），
   而不是在死墙上重试烧尝试次数。
 - **风险核对点**：`doKeyUpstream` 的 cursor 对非空池从不返回 nil（冷却只是降级偏好），
@@ -255,8 +261,9 @@ errBusy → 429 {"type":"rate_limit_error","code":"gateway_busy"}, Retry-After: 
   不经过 `handleInference` 的 SystemOne 专用 handler，否则存在无界旁路；
   `release` 用 `defer` 挂满整个回合（含流式转发全程）。
 - 计数语义：inflight = 正在进行的推理回合（从拿到 slot 到回合结束），与传输层连接数无关。
-- **暴露**：WebUI/健康状态 JSON 增加 `inflight`、`queued` 两个字段（admin/server.go 状态端点，
-  实现时定位具体 handler；若结构不便则先日志+telemetry，WebUI 项记入 §10 待办）。
+- **暴露（v1.5.2 扩展）**：healthz `load` 段（inflight/queued/limit + **queued_total** 累计计数，
+  实现于 health.go healthLoad）；请求排队时 `gated` 记 Info 事件 `inflight_queued`（含 waited 时长）
+  ——2026-11-05 压测实证饱和只能外部轮询采样，排队本身无日志。WebUI 展示仍为 §10 待办。
 - **tebi 建议值**：`max_inflight: 12`（New-API 两渠道各 max_inflight 5 + 管理面余量），
   `queue_wait_seconds: 10`；**默认 0/0 完全关闭**。
 

@@ -27,11 +27,14 @@ type healthResponse struct {
 	Issues []string    `json:"issues,omitempty"`
 }
 
-// healthLoad is the operator view of the inflight gate.
+// healthLoad is the operator view of the inflight gate. queued is the
+// instantaneous waiter count; queued_total accumulates every request that
+// had to wait, so saturation survives the burst.
 type healthLoad struct {
-	Inflight int64 `json:"inflight"`
-	Limit    int   `json:"limit"`
-	Queued   int64 `json:"queued"`
+	Inflight    int64 `json:"inflight"`
+	Limit       int   `json:"limit"`
+	Queued      int64 `json:"queued"`
+	QueuedTotal int64 `json:"queued_total"`
 }
 
 type healthModels struct {
@@ -179,9 +182,10 @@ func (g *Gateway) healthLoad() *healthLoad {
 		return nil
 	}
 	return &healthLoad{
-		Inflight: g.inflight.inflight.Load(),
-		Limit:    cap(g.inflight.slots),
-		Queued:   g.inflight.queued.Load(),
+		Inflight:    g.inflight.inflight.Load(),
+		Limit:       cap(g.inflight.slots),
+		Queued:      g.inflight.queued.Load(),
+		QueuedTotal: g.inflight.queuedTotal.Load(),
 	}
 }
 

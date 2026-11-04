@@ -25,7 +25,7 @@ func TestInflightAcquireFreeSlot(t *testing.T) {
 	if gate == nil {
 		t.Fatal("gate should exist for max=2")
 	}
-	release, err := gate.acquire(context.Background())
+	release, _, err := gate.acquire(context.Background())
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -41,13 +41,13 @@ func TestInflightAcquireFreeSlot(t *testing.T) {
 // A full gate with wait=0 rejects immediately.
 func TestInflightImmediateBusy(t *testing.T) {
 	gate := newInflightGate(1, 0)
-	release, err := gate.acquire(context.Background())
+	release, _, err := gate.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release()
 	started := time.Now()
-	if _, err := gate.acquire(context.Background()); err != errInflightBusy {
+	if _, _, err := gate.acquire(context.Background()); err != errInflightBusy {
 		t.Fatalf("err = %v, want errInflightBusy", err)
 	}
 	if time.Since(started) > 50*time.Millisecond {
@@ -58,7 +58,7 @@ func TestInflightImmediateBusy(t *testing.T) {
 // A full gate queues for up to wait and hands over the slot on release.
 func TestInflightQueueHandover(t *testing.T) {
 	gate := newInflightGate(1, 2)
-	release, err := gate.acquire(context.Background())
+	release, _, err := gate.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,12 +67,15 @@ func TestInflightQueueHandover(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		r, err := gate.acquire(context.Background())
+		r, waited, err := gate.acquire(context.Background())
 		if err != nil {
 			t.Errorf("queued acquire: %v", err)
 			return
 		}
 		defer r()
+		if waited <= 0 {
+			t.Errorf("queued acquire reported waited=%v, want > 0", waited)
+		}
 		acquired <- struct{}{}
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -86,18 +89,21 @@ func TestInflightQueueHandover(t *testing.T) {
 		t.Fatal("queued acquire never got the released slot")
 	}
 	wg.Wait()
+	if got := gate.queuedTotal.Load(); got < 1 {
+		t.Fatalf("queued_total = %d, want at least 1 after a queued acquire", got)
+	}
 }
 
 // A queued acquire times out with errInflightBusy when no slot frees up.
 func TestInflightQueueTimeout(t *testing.T) {
 	gate := newInflightGate(1, 1) // 1 second wait
-	release, err := gate.acquire(context.Background())
+	release, _, err := gate.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release()
 	started := time.Now()
-	if _, err := gate.acquire(context.Background()); err != errInflightBusy {
+	if _, _, err := gate.acquire(context.Background()); err != errInflightBusy {
 		t.Fatalf("err = %v, want errInflightBusy", err)
 	}
 	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
@@ -108,14 +114,14 @@ func TestInflightQueueTimeout(t *testing.T) {
 // A queued acquire honors context cancellation.
 func TestInflightQueueContextCanceled(t *testing.T) {
 	gate := newInflightGate(1, 5)
-	release, _ := gate.acquire(context.Background())
+	release, _, _ := gate.acquire(context.Background())
 	defer release()
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		cancel()
 	}()
-	if _, err := gate.acquire(ctx); err == nil {
+	if _, _, err := gate.acquire(ctx); err == nil {
 		t.Fatal("canceled wait must return an error")
 	}
 }
@@ -126,7 +132,7 @@ func TestInflightDisabled(t *testing.T) {
 		t.Fatal("max=0 must disable the gate")
 	}
 	gate := newInflightGate(0, 0)
-	release, err := gate.acquire(context.Background())
+	release, _, err := gate.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +149,7 @@ func TestGatedWrapperBoundsHandler(t *testing.T) {
 		logger:   testLogger(t),
 		inflight: newInflightGate(1, 0),
 	}
-	release, err := g.inflight.acquire(context.Background())
+	release, _, err := g.inflight.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

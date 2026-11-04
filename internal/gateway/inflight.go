@@ -24,6 +24,10 @@ type inflightGate struct {
 	wait     time.Duration
 	inflight atomic.Int64
 	queued   atomic.Int64
+	// queuedTotal counts every request that had to wait for a slot, so
+	// saturation stays visible cumulatively (healthz load.queued_total) and
+	// not only as the instantaneous queued gauge.
+	queuedTotal atomic.Int64
 }
 
 func newInflightGate(maxInflight, queueWaitSeconds int) *inflightGate {
@@ -38,10 +42,12 @@ func newInflightGate(maxInflight, queueWaitSeconds int) *inflightGate {
 
 // acquire occupies one slot for the whole turn. A full gate queues the caller
 // for up to wait (0 rejects immediately) before giving up with
-// errInflightBusy. The returned release function must be called exactly once.
-func (g *inflightGate) acquire(ctx context.Context) (func(), error) {
+// errInflightBusy. The returned release function must be called exactly once;
+// waited reports how long the caller was queued (0 when a slot was free), so
+// the caller can log saturation it would otherwise only see by polling.
+func (g *inflightGate) acquire(ctx context.Context) (func(), time.Duration, error) {
 	if g == nil {
-		return func() {}, nil
+		return func() {}, 0, nil
 	}
 	release := func() {
 		<-g.slots
@@ -50,23 +56,25 @@ func (g *inflightGate) acquire(ctx context.Context) (func(), error) {
 	select {
 	case g.slots <- struct{}{}:
 		g.inflight.Add(1)
-		return release, nil
+		return release, 0, nil
 	default:
 	}
+	queuedAt := time.Now()
 	g.queued.Add(1)
+	g.queuedTotal.Add(1)
 	defer g.queued.Add(-1)
 	if g.wait <= 0 {
-		return nil, errInflightBusy
+		return nil, 0, errInflightBusy
 	}
 	timer := time.NewTimer(g.wait)
 	defer timer.Stop()
 	select {
 	case g.slots <- struct{}{}:
 		g.inflight.Add(1)
-		return release, nil
+		return release, time.Since(queuedAt), nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, time.Since(queuedAt), ctx.Err()
 	case <-timer.C:
-		return nil, errInflightBusy
+		return nil, time.Since(queuedAt), errInflightBusy
 	}
 }

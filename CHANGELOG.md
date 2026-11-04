@@ -4,6 +4,34 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.5.2 (2026-11-05) — test-driven iteration
+
+Findings from the 2026-11-05 production test pass (probe events 43
+recovered / 45 still-walled, inflight saturation sampled externally, zero
+quota pre-check events during the wall).
+
+### Added
+
+- **Queue observability**: the inflight gate now counts every request that
+  had to wait (`queued_total`, exposed in `healthz` `load`) and logs an
+  `inflight_queued` event with the wait duration — saturation is visible in
+  the request log instead of only by polling `healthz.load` during a burst.
+- **Probe model prefers non-reasoning free models.** Production probes
+  through deepseek streamed reasoning before answering, spending part of the
+  probe's token budget on thinking; with capability metadata the probe now
+  picks the first non-reasoning free model and falls back to the first free
+  model only when no such candidate exists.
+
+### Documented
+
+- The quota pre-check fires only when the anonymous lane cannot take a
+  request. On deployments that keep the anonymous lane enabled **without**
+  `models.anonymous_backoff`, its circuit breaker is disabled (upstream
+  semantics), so the pre-check stays dormant during free-pool walls — the
+  observed production behavior. Operators who want wall-time rejection with
+  zero upstream calls should configure `anonymous_backoff` to arm the
+  breaker; probe loop and key cooldowns are unaffected.
+
 ## v1.5.1 (2026-11-04) — post-review hardening
 
 Findings from the production code review of v1.5.0, all resolved.

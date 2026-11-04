@@ -150,14 +150,19 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 }
 
 // quotaProbeModel picks the model a quota probe should use: the first model
-// the catalog considers free, supported and native on the key lane. The quota
-// that gates a key is not model-specific, so the first available answer wins;
-// a stable choice keeps consecutive probes comparable.
+// the catalog considers free, supported and native on the key lane. A
+// non-reasoning model is preferred when one exists — production probes
+// (2026-11-05) showed a reasoning model spends part of its probe budget
+// thinking before answering, costing extra tokens and latency on every probe.
+// The quota that gates a key is not model-specific, so any free model works;
+// the first acceptable choice keeps consecutive probes comparable.
 func (g *Gateway) quotaProbeModel(zen bool) (string, wire.Protocol, bool) {
 	tier := config.TierZen
 	if !zen {
 		tier = config.TierGo
 	}
+	var fallbackModel string
+	var fallbackProtocol wire.Protocol
 	for _, model := range g.catalog.List() {
 		if !g.catalog.IsFreeModel(model) || !g.catalog.Supported(model) {
 			continue
@@ -167,7 +172,15 @@ func (g *Gateway) quotaProbeModel(zen bool) (string, wire.Protocol, bool) {
 		if !ok {
 			continue
 		}
-		return model, protocol, true
+		if !g.catalog.MetadataForTier(model, tier).Reasoning {
+			return model, protocol, true
+		}
+		if fallbackModel == "" {
+			fallbackModel, fallbackProtocol = model, protocol
+		}
+	}
+	if fallbackModel != "" {
+		return fallbackModel, fallbackProtocol, true
 	}
 	return "", wire.Chat, false
 }
