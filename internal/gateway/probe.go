@@ -373,7 +373,6 @@ func isEffortRejection(status int, body string) bool {
 	return false
 }
 
-
 // mustJSON re-serializes a decoded document for the marker scan in
 // DetectReasoning; the input came straight from json.Decode so this cannot
 // fail in practice.
