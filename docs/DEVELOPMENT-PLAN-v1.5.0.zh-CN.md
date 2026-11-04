@@ -231,10 +231,17 @@ if lane, until, ok := g.quotaWallFor(route); ok {     // route 涉及的所有 k
   全部命中才预检。**anonymous lane 不纳入**（有自己的熔断）。
 - **旁路**：probe / Playground 身份（v1.4.6 已有 `probeRequestIDs` 身份分离，#162）直接跳过预检，
   保证管理面探活永远可达。
-- **前置条件（v1.5.2 生产实证补充）**：预检要求匿名道不可用（关闭/熔断开启）。若部署启用匿名道
-  但未配置 `models.anonymous_backoff`，上游语义下熔断器是**关闭**的（threshold<1 恒放行），
-  预检因此整墙期不触发——2026-11-05 tebi 墙期 `quota_precheck_blocked` 零事件实证。
-  运营若要墙期零上游拒绝，需同时配置 `anonymous_backoff` 启用熔断。
+- **匿名道条件（v1.5.3 重写）**：预检要求匿名道无法承接请求 = 关闭 ∥ 熔断开启 ∥ **实测墙**
+  （匿名道 10 分钟窗口内 ≥2 次 429，`observeAnonymousWall`/`anonymousLaneWalled`；匿名道只服务
+  free 模型，其 429 即墙）。v1.5.2 的 `route.Anonymous` 旁路被移除——它使匿名先行的 free 流量
+  （tebi 形状）永远绕过预检。恢复路径自愈：匿名道 2xx 或探活成功即清信号，窗口超时自动解除，
+  下一次真实 walk 重新武装。**生产语义**：墙期每笔 live 请求从 3 次上游调用（anon+key+key）
+  降为 armed 后 0 次，前两次 walk 仍保留作为墙的探测。
+- **旁路**：probe / Playground 身份（v1.4.6 已有 `probeRequestIDs` 身份分离，#162）直接跳过预检，
+  保证管理面探活永远可达。
+- **v1.5.2 探针模型偏好的诚实修正**：能力目录实证全部 free 模型 `reasoning=true`（beam-free 亦然，
+  且其实测响应带 reasoning_content）——偏好逻辑无候选可选，休眠中保留（上游未来放出非 reasoning
+  free 模型时自动生效）。探针成本对配额无影响（免费层按请求数计，非按 token）。
 - 与 New-API 的配合：429 + Retry-After 让渠道层毫秒级降级到 P5 商业渠道（tebi 10-28 已验证的行为），
   而不是在死墙上重试烧尝试次数。
 - **风险核对点**：`doKeyUpstream` 的 cursor 对非空池从不返回 nil（冷却只是降级偏好），

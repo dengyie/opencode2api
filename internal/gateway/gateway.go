@@ -97,6 +97,13 @@ type Gateway struct {
 	// inflight bounds concurrent inference turns (v1.5.0). Nil disables
 	// admission control entirely.
 	inflight *inflightGate
+	// Empirical anonymous-wall signal (v1.5.3): the anonymous lane answered
+	// 429 free-usage-limit recently. count accumulates within the window and
+	// resets on a 2xx or when the window lapses; it lets the quota pre-check
+	// cover anonymous-first routes (the tebi traffic shape) whose breaker is
+	// disabled by missing anonymous_backoff config.
+	anonWallCount  atomic.Int32
+	anonWallLastAt atomic.Int64
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -369,7 +376,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		// already knows, and the 429 lets a fronting gateway degrade to the
 		// next channel immediately.
 		if !isDiagnosticRequest(r.Context()) {
-			if until, walled := g.quotaWallFor(route); walled {
+			if until, walled := g.quotaWall(); walled {
 				retryAfter := int((time.Until(until) + time.Second - 1) / time.Second)
 				if retryAfter < 1 {
 					retryAfter = 1

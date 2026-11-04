@@ -5,8 +5,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"net/http"
+
 	"opencode2api/internal/config"
-	models "opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
 )
 
@@ -136,6 +137,9 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 	}
 	if result.success {
 		nodes.MarkSuccess(node)
+		// The pool reopened: drop the empirical anonymous-wall signal so the
+		// pre-check stands down immediately instead of riding out its window.
+		g.anonWallCount.Store(0)
 		g.logger.Info("quota probe recovered a key", "component", "upstream", "event", "quota_probe_recovered", "tier", tier, "key_id", config.KeyDisplayID(node.key), "model", model, "probe_ms", time.Since(started).Milliseconds())
 		return
 	}
@@ -212,14 +216,54 @@ func (g *Gateway) anonymousLaneAvailable() bool {
 	return true
 }
 
-// quotaWallFor reports whether the request's possible lanes are all
-// quota-cooled, and when the first key reopens. Conservative by design: it
-// fires only when EVERY configured key lane is fully walled AND the anonymous
-// lane cannot take the request (disabled, breaker open, or the route starts
-// there anyway). A lane that might still serve the model never pre-checks a
-// request away.
-func (g *Gateway) quotaWallFor(route models.Route) (time.Time, bool) {
-	if route.Anonymous || g.anonymousLaneAvailable() {
+// anonWallWindow is how long recent anonymous-lane 429s count toward the
+// empirical wall signal.
+const anonWallWindow = 10 * time.Minute
+
+// observeAnonymousWall feeds the empirical wall signal with one anonymous-lane
+// outcome (v1.5.3): 429s accumulate within the window; any 2xx proves the lane
+// can serve again and clears it. The anonymous lane serves only free models,
+// so its 429 is the free-usage wall by definition.
+func (g *Gateway) observeAnonymousWall(status int) {
+	if status/100 == 2 {
+		g.anonWallCount.Store(0)
+		return
+	}
+	if status != http.StatusTooManyRequests {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := g.anonWallLastAt.Load()
+	if last == 0 || now-last > int64(anonWallWindow) {
+		g.anonWallCount.Store(1)
+	} else {
+		g.anonWallCount.Add(1)
+	}
+	g.anonWallLastAt.Store(now)
+}
+
+// anonymousLaneWalled reports whether the anonymous lane answered 429 often
+// enough recently to be treated as empirically walled. Two observations within
+// the window keep the signal robust against a single fluke while staying
+// cheap: the second request's walk arms it for everything that follows.
+func (g *Gateway) anonymousLaneWalled() bool {
+	last := g.anonWallLastAt.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) > anonWallWindow {
+		return false
+	}
+	return g.anonWallCount.Load() >= 2
+}
+
+// quotaWall reports whether the request's possible lanes are all quota-cooled,
+// and when the first key reopens. The anonymous lane must be unable to take
+// the request — disabled, paused by its breaker, or empirically walled (its
+// own recent 429s) — because it is either the route's primary lane
+// (route.Anonymous free-model traffic, the tebi shape) or the key lanes'
+// fallback. A lane that might still serve the model never pre-checks a
+// request away. (v1.5.3 replaces the v1.5.2 route.Anonymous bypass, which
+// made the pre-check unreachable for anonymous-first traffic.)
+func (g *Gateway) quotaWall() (time.Time, bool) {
+	if g.anonymousLaneAvailable() && !g.anonymousLaneWalled() {
 		return time.Time{}, false
 	}
 	zenConfigured := len(g.cfg.ZenKeys) > 0

@@ -142,3 +142,73 @@ func TestGeoBlockClassification(t *testing.T) {
 		t.Fatal("the client message must name the region cause")
 	}
 }
+
+// The empirical anonymous-wall signal: two 429s within the window arm it, a
+// 2xx clears it, non-429 failures do not feed it, and a stale window
+// disarms it.
+func TestAnonymousWallSignal(t *testing.T) {
+	g := &Gateway{}
+	if g.anonymousLaneWalled() {
+		t.Fatal("no observations must not arm the wall")
+	}
+	g.observeAnonymousWall(http.StatusTooManyRequests)
+	if g.anonymousLaneWalled() {
+		t.Fatal("a single 429 must not arm the wall")
+	}
+	g.observeAnonymousWall(http.StatusTooManyRequests)
+	if !g.anonymousLaneWalled() {
+		t.Fatal("two 429s within the window must arm the wall")
+	}
+	g.observeAnonymousWall(http.StatusOK)
+	if g.anonymousLaneWalled() {
+		t.Fatal("a 2xx must clear the wall signal")
+	}
+	g.observeAnonymousWall(http.StatusForbidden)
+	if g.anonymousLaneWalled() {
+		t.Fatal("a non-429 failure must not arm the wall")
+	}
+	g.observeAnonymousWall(http.StatusTooManyRequests)
+	g.observeAnonymousWall(http.StatusTooManyRequests)
+	if !g.anonymousLaneWalled() {
+		t.Fatal("re-armed after the clear")
+	}
+	g.anonWallLastAt.Store(time.Now().Add(-11 * time.Minute).UnixNano())
+	if g.anonymousLaneWalled() {
+		t.Fatal("a stale window must disarm the wall")
+	}
+}
+
+// The pre-check covers anonymous-first routes (the tebi free-model shape):
+// with the anonymous lane enabled and empirically walled, walled keys
+// pre-check the request; a healthy anonymous lane stands it down; a 2xx
+// observation clears it.
+func TestQuotaWallCoversAnonymousRoute(t *testing.T) {
+	upstream := fakeUpstream(t, nil)
+	g := gatewayFor(t, upstream.URL, `{"max_attempts": 1, "timeout_seconds": 30}`, `{"heartbeat_seconds": 0}`)
+	// Flip the config to the tebi shape: anonymous lane enabled. The gateway
+	// was built with anonymous=false, so patch the field the wall logic reads.
+	g.cfg.Anonymous = true
+	g.cfg.Upstream.Anonymous = upstream.URL
+	node := g.zenNodes.nodes[0]
+	g.zenNodes.MarkFailure(node, quotaResponse("3600"), nil)
+
+	// No anonymous observations yet: the lane might still serve, stand down.
+	if _, walled := g.quotaWall(); walled {
+		t.Fatal("healthy anonymous lane must stand down the pre-check")
+	}
+	// Two anonymous 429s: empirically walled, keys walled → pre-check fires.
+	g.observeAnonymousWall(http.StatusTooManyRequests)
+	g.observeAnonymousWall(http.StatusTooManyRequests)
+	until, walled := g.quotaWall()
+	if !walled {
+		t.Fatal("walled keys + empirically walled anonymous lane must pre-check")
+	}
+	if time.Until(until) < 3590*time.Second {
+		t.Fatalf("retry-after must track the key recovery instant, got %v", time.Until(until))
+	}
+	// A 2xx on the anonymous lane stands the pre-check back down.
+	g.observeAnonymousWall(http.StatusOK)
+	if _, walled := g.quotaWall(); walled {
+		t.Fatal("a 2xx observation must stand down the pre-check")
+	}
+}

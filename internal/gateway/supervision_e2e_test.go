@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,5 +292,114 @@ func TestE2EQuotaProbeStillWalled(t *testing.T) {
 	}
 	if time.Until(time.Unix(0, node.probeNextAt.Load())) <= 0 {
 		t.Fatal("a still-walled probe must reschedule the next probe")
+	}
+}
+
+// End-to-end wall behavior with the tebi traffic shape: the anonymous lane is
+// the route's primary lane (route.Anonymous), everything upstream is 429-walled,
+// and the anonymous breaker is disabled (no anonymous_backoff). The first two
+// requests walk the lanes and arm the empirical wall signal; from the third the
+// quota pre-check answers with zero upstream calls.
+func TestE2EQuotaPrecheckAnonymousRoute(t *testing.T) {
+	var upstreamCalls atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"mimo-v2.6-flash-free"}]}`))
+	})
+	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"opencode":{"id":"opencode","api":"https://opencode.ai/zen","npm":"@ai-sdk/openai-compatible","models":{"mimo-v2.6-flash-free":{"id":"mimo-v2.6-flash-free"}}}}`))
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"Free usage limit reached","type":"upstream_error"}}`))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	doc := `{
+		"listen": "127.0.0.1:0",
+		"server_keys": ["sk-local"],
+		"zen_keys": ["sk-zen"],
+		"anonymous": true,
+		"proxies": ["direct"],
+		"upstream": {"zen": "` + server.URL + `", "go": "` + server.URL + `", "anonymous": "` + server.URL + `"},
+		"retry": {"max_attempts": 1, "timeout_seconds": 30},
+		"models": {"refresh_seconds": 300},
+		"performance": {"heartbeat_seconds": 0, "quota_probe_seconds": 0}
+	}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	cfg.Models.RefreshSeconds = 1
+	origCapabilitiesURL := models.CapabilitiesURL
+	models.CapabilitiesURL = server.URL + "/capabilities"
+	t.Cleanup(func() { models.CapabilitiesURL = origCapabilitiesURL })
+	g, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+	if err != nil {
+		t.Fatalf("gateway: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	g.StartModelRefresh(ctx)
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(g.catalog.List()) > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(g.catalog.List()) == 0 {
+		t.Fatal("catalog never populated")
+	}
+
+	apiServer := httptest.NewServer(g.Handler())
+	defer apiServer.Close()
+	post := func() (int, string) {
+		req, _ := http.NewRequest(http.MethodPost, apiServer.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"mimo-v2.6-flash-free","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("x-api-key", "sk-local")
+		resp, err := apiServer.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(raw)
+	}
+
+	// First two walks: anonymous lane and key lane both 429, arming the signal.
+	for i := 0; i < 2; i++ {
+		status, body := post()
+		if status != http.StatusTooManyRequests {
+			t.Fatalf("walk request %d: status = %d, want 429", i+1, status)
+		}
+		if strings.Contains(body, "quota-cooled") {
+			t.Fatalf("walk request %d must reach the upstream, got the pre-check: %q", i+1, body)
+		}
+	}
+	walkCalls := upstreamCalls.Load()
+	if walkCalls == 0 {
+		t.Fatal("the walks must reach the upstream")
+	}
+	// Third request: pre-checked with zero upstream calls.
+	status, body := post()
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("pre-checked status = %d, want 429", status)
+	}
+	if !strings.Contains(body, "insufficient_quota") || !strings.Contains(body, "quota-cooled") {
+		t.Fatalf("pre-check body missing: %q", body)
+	}
+	if got := upstreamCalls.Load(); got != walkCalls {
+		t.Fatalf("the pre-checked request must not touch the upstream: calls %d -> %d", walkCalls, got)
 	}
 }

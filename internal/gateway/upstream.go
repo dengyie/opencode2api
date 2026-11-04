@@ -1084,6 +1084,7 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 	}
 	status := upstreamStatus(resp)
 	g.syncProxyResult(ctx, node.proxy, status, err)
+	g.observeAnonymousWall(status)
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
 		g.anonymous.NoteSuccess()

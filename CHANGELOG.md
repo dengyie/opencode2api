@@ -4,6 +4,34 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.5.3 (2026-11-05) — wall-aware quota pre-check
+
+From continued production testing of v1.5.2: the free-pool capability
+catalog marks **every** free model `reasoning=true` (so the v1.5.2 probe
+model preference has no non-reasoning candidate to pick and stays on its
+fallback — kept for the day upstream ships one), and free-model routes start
+on the anonymous lane (`route.Anonymous=true`), which made the v1.5.2
+pre-check unreachable for exactly the traffic shape it was built for: wall
+periods burned 3 upstream calls per live request (anonymous walk + two key
+attempts) with `quota_precheck_blocked` never firing.
+
+### Fixed
+
+- **The quota pre-check now covers anonymous-first routes.** The
+  `route.Anonymous` bypass is replaced by an empirical wall signal: the
+  anonymous lane observed answering 429 twice within 10 minutes counts as
+  walled (its breaker being disabled without `anonymous_backoff` no longer
+  blocks the pre-check). Any 2xx on the lane or a successful quota probe
+  stands the signal down, and a lapsed window disarms it — the pre-check
+  re-arms itself on the next real walk, so recovery is never blocked.
+
+### Effect
+
+During a free-pool wall with the default config, live requests now cost 0
+upstream calls after the first two walks (previously 3 per request for as
+long as the wall lasted), while New-API still gets `429 insufficient_quota`
++ `Retry-After` for its smooth degradation to paid channels.
+
 ## v1.5.2 (2026-11-05) — test-driven iteration
 
 Findings from the 2026-11-05 production test pass (probe events 43
