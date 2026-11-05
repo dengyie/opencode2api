@@ -394,6 +394,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
 		limit = g.cfg.Retry.MaxAttempts
 	}
+	// Empirical-wall fast failover (v1.5.6): while the lane is 429-walled and
+	// a Zen key can take over, one exit attempt is enough to catch the wall
+	// lifting — the rest of the first-token budget belongs to the keys.
+	if g.anonWallFastFailover() && slices.Contains(route.KeyTiers, config.TierZen) {
+		limit = min(limit, 1)
+		g.logger.Info("anonymous lane is walled; capping the exit walk for a fast key failover", "component", "upstream", "event", "anon_wall_fast_failover", "request_id", ids.Request, "exits", limit)
+	}
 	proxies := 0
 	attempts := 0
 	rawBody := bodies[config.TierZen]

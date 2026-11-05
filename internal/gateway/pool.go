@@ -908,6 +908,23 @@ func (p *upstreamNodes) cooldownFor(node *upstreamNode, resp *http.Response, err
 	return delay
 }
 
+// HasUsableNode reports whether any key of this pool is currently usable: its
+// cooldown, which includes a quota wall (a 429 sets both), has expired. The
+// anonymous walk consults this before cutting its exit cap short — an early
+// handover to the key tiers is only worth it when a key can actually serve.
+func (p *upstreamNodes) HasUsableNode() bool {
+	if p == nil {
+		return false
+	}
+	now := time.Now().UnixNano()
+	for _, node := range p.nodes {
+		if node.cooldownUntil.Load() <= now {
+			return true
+		}
+	}
+	return false
+}
+
 // QuotaCooledNodes returns the pool's keys that are currently quota-cooled.
 func (p *upstreamNodes) QuotaCooledNodes() []*upstreamNode {
 	if p == nil {

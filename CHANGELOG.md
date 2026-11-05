@@ -4,6 +4,31 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.5.6 (2026-11-05) — anonymous-wall fast failover to the key tiers
+
+Production traffic analysis (629 routed requests, 2026-11-05) showed the
+anonymous lane's exit walk defeating the key fallback: while the lane is
+429-walled, each exit attempt costs 1.7–26s, so a request could spend its
+entire fronting-gateway first-token budget (30s) walking up to six exits
+before the key tiers were ever consulted — the key fallback then never
+completes and the caller cancels (15× 499 in two hours).
+
+### Changed
+
+- The anonymous exit walk (proxy-backed and WARP paths alike) caps itself at
+  one attempt when the empirical wall signal is armed (≥2 lane 429s within
+  the 10-minute window) **and** at least one Zen key is currently usable.
+  One attempt still catches the wall lifting; with no usable key the walk
+  keeps its full cap, because the exits are then the only lane that can
+  answer.
+
+### Added
+
+- `config_attempt_timeout_covers_request` (WARN at startup): fired when
+  `performance.attempt_timeout_seconds >= retry.timeout_seconds` — the
+  misconfiguration that cut established streams at exactly 30s in production
+  before the 2026-11-05 timeout split.
+
 ## v1.5.5 (2026-11-05) — quota state visibility
 
 An 11-hour production soak exposed three diagnostic blind spots, all of them

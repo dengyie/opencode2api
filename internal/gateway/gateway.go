@@ -143,6 +143,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	catalog := models.Catalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
+	warnTimeoutCover(cfg, logger)
 	return &Gateway{
 		cfg:            cfg,
 		rotation:       rotationManager,
@@ -158,6 +159,22 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		freeTierBlock:  time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
 		inflight:       newInflightGate(cfg.Performance.MaxInflight, cfg.Performance.QueueWaitSeconds),
 	}, nil
+}
+
+// warnTimeoutCover warns when the per-attempt first-token gate is as large as
+// the whole-request budget: the transport then cuts established streams at
+// the attempt deadline, which is the misconfiguration that turned normal long
+// streams into stream_error/out=0 at exactly 30s in production (2026-11-05).
+func warnTimeoutCover(cfg config.Config, logger *slog.Logger) {
+	attempt := time.Duration(cfg.Performance.AttemptTimeoutSeconds) * time.Second
+	request := time.Duration(cfg.Retry.TimeoutSeconds) * time.Second
+	if attempt <= 0 || attempt < request {
+		return
+	}
+	logger.Warn("performance.attempt_timeout_seconds >= retry.timeout_seconds: the first-token gate covers the whole request budget, so an established stream is cut at the attempt deadline; raise retry.timeout_seconds above the attempt timeout",
+		"component", "gateway", "event", "config_attempt_timeout_covers_request",
+		"attempt_timeout_seconds", cfg.Performance.AttemptTimeoutSeconds,
+		"request_timeout_seconds", cfg.Retry.TimeoutSeconds)
 }
 
 // anonymousBackoffFromConfig converts the configured hours into the breaker's

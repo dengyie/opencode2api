@@ -280,6 +280,19 @@ func (g *Gateway) anonymousLaneWalled() bool {
 	return g.anonWallCount.Load() >= 2
 }
 
+// anonWallFastFailover reports whether the anonymous walk should hand the
+// request to the key tiers after a single attempt: the lane is empirically
+// 429-walled (two within the window) and at least one Zen key is currently
+// usable. Walking every exit through a walled lane burns the caller's
+// first-token budget before the keys ever see the request (each 429 costs
+// 1.7–26s in production), so the fronting gateway cancels at its TTFT gate
+// and the key fallback never completes. One attempt still catches the wall
+// lifting; with no usable key the walk keeps its full cap, because the exits
+// are then the only lane that can answer.
+func (g *Gateway) anonWallFastFailover() bool {
+	return g.anonymousLaneWalled() && g.zenNodes.HasUsableNode()
+}
+
 // quotaWall reports whether the request's possible lanes are all quota-cooled,
 // and when the first key reopens. The anonymous lane must be unable to take
 // the request — disabled, paused by its breaker, or empirically walled (its

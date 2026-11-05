@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -244,6 +245,13 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	limit := g.cfg.Retry.MaxAttempts
 	if limit < 1 {
 		limit = 1
+	}
+	// Empirical-wall fast failover (v1.5.6): same contract as the proxy-backed
+	// walk — while the lane is walled and a Zen key can serve, one attempt is
+	// enough to catch the wall lifting.
+	if g.anonWallFastFailover() && slices.Contains(route.KeyTiers, config.TierZen) {
+		limit = min(limit, 1)
+		g.logger.Info("anonymous lane is walled; capping the exit walk for a fast key failover", "component", "upstream", "event", "anon_wall_fast_failover", "request_id", ids.Request, "exits", limit)
 	}
 	firstEventTimeout := time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds) * time.Second
 	var lastResponse *http.Response
