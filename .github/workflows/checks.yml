@@ -60,3 +60,15 @@ jobs:
           done
       - name: Check container entrypoint syntax
         run: sh -n docker-entrypoint.sh
+
+  test:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test ./... -race -count=1

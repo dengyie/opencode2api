@@ -6,12 +6,12 @@ file tracks what this repository adds on top of the imported baseline.
 
 ## v1.5.6 (2026-11-05) — anonymous-wall fast failover to the key tiers
 
-Production traffic analysis (629 routed requests, 2026-11-05) showed the
-anonymous lane's exit walk defeating the key fallback: while the lane is
-429-walled, each exit attempt costs 1.7–26s, so a request could spend its
-entire fronting-gateway first-token budget (30s) walking up to six exits
-before the key tiers were ever consulted — the key fallback then never
-completes and the caller cancels (15× 499 in two hours).
+Production traffic analysis showed the anonymous lane's exit walk defeating
+the key fallback: while the lane is 429-walled, each exit attempt costs
+seconds (observed 1.7–26s), so a request could spend its entire
+fronting-gateway first-token budget walking up to six exits before the key
+tiers were ever consulted — the key fallback then never completes and the
+caller cancels.
 
 ### Changed
 

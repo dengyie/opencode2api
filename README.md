@@ -52,10 +52,10 @@ See the [management console guide (Chinese)](docs/management.zh-CN.md) for the n
 
 ## Quick start
 
-Download a binary from [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases), or build with **Go 1.24 or newer**:
+Download a binary from [GitHub Releases](https://github.com/dengyie/opencode2api/releases), or build with **Go 1.24 or newer**:
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/dengyie/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -87,7 +87,7 @@ The configuration directory must be writable for password migration, configurati
 
 ## Docker
 
-The published image is `ghcr.io/jasonxu114514/opencode2api`.
+The published image is `ghcr.io/dengyie/opencode2api`.
 
 ```bash
 cp config.example.json config.json

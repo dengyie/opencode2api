@@ -49,10 +49,10 @@ GEO 拒绝分类。详见 [CHANGELOG.md](CHANGELOG.md) 与
 
 ## 快速开始
 
-从 [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases) 下载可执行文件，或使用 **Go 1.24 及以上版本**编译：
+从 [GitHub Releases](https://github.com/dengyie/opencode2api/releases) 下载可执行文件，或使用 **Go 1.24 及以上版本**编译：
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/dengyie/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 go build -o opencode2api ./cmd/opencode2api
@@ -84,7 +84,7 @@ Windows 下使用 `Copy-Item config.example.json config.json` 复制配置，执
 
 ## Docker 部署
 
-已发布镜像：`ghcr.io/jasonxu114514/opencode2api`。
+已发布镜像：`ghcr.io/dengyie/opencode2api`。
 
 ```bash
 cp config.example.json config.json
