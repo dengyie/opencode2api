@@ -109,11 +109,15 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 		// Nothing to probe with yet (catalog still empty at startup); try
 		// again on the next tick.
 		reschedule()
+		g.logger.Info("quota probe skipped", "component", "upstream", "event", "quota_probe_skipped",
+			"tier", tierOf(nodes, g), "key_id", config.KeyDisplayID(node.key), "reason", "no_probe_model")
 		return
 	}
 	proxy := nodes.Proxy(node)
 	if proxy == nil {
 		reschedule()
+		g.logger.Info("quota probe skipped", "component", "upstream", "event", "quota_probe_skipped",
+			"tier", tierOf(nodes, g), "key_id", config.KeyDisplayID(node.key), "reason", "no_proxy")
 		return
 	}
 	ids := probeRequestIDs()
@@ -133,6 +137,8 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 		// No request reached the upstream (transport/proxy down): probe again
 		// next interval without changing any cooldown state.
 		reschedule()
+		g.logger.Info("quota probe skipped", "component", "upstream", "event", "quota_probe_skipped",
+			"tier", tier, "key_id", config.KeyDisplayID(node.key), "reason", "not_attempted")
 		return
 	}
 	if result.success {

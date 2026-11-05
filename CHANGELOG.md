@@ -4,6 +4,33 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.5.5 (2026-11-05) — quota state visibility
+
+An 11-hour production soak exposed three diagnostic blind spots, all of them
+in log coverage rather than routing: a fully quota-walled key pool produced no
+trace at all, the probe loop's skip paths were silent, and a 502 caused by a
+body read cut short by the caller's deadline was indistinguishable from a real
+upstream failure.
+
+### Added
+
+- `key_quota_cooled` (INFO): logged when a keyed 429 marks the key
+  quota-cooled, with `key_id`, `tier` and the adopted `retry_after_seconds`.
+  A walled pool is now visible the moment it walls, not when the next caller
+  pays for the discovery.
+- `quota_probe_skipped` (INFO): the probe loop's three silent reschedule
+  paths — `no_probe_model`, `no_proxy`, `not_attempted` — now log their
+  reason instead of leaving the operator with a loop that appears dead.
+- `upstream_body_read_failed` (WARN): the non-streaming body read failure now
+  carries the underlying error and upstream status. Production showed 15.0s
+  reads ending in 502 — the caller's own time-to-first-token budget cutting
+  the connection, not an upstream fault.
+
+### Notes
+
+- No routing, quota or retry semantics changed; this release only makes the
+  existing state observable.
+
 ## v1.5.4 (2026-11-05) — empirical reasoning observation
 
 Production verification of the capability catalog showed its `reasoning`

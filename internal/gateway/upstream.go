@@ -1072,6 +1072,16 @@ func (g *Gateway) observeKeyResult(ctx context.Context, nodes *upstreamNodes, no
 	}
 	if !proxyFailed || nodes.Proxy(node) == proxy {
 		nodes.MarkFailure(node, resp, err)
+		if status == http.StatusTooManyRequests {
+			// Surface the per-key quota wall: without this line a fully walled
+			// pool looks healthy in the log until a caller pays for the
+			// discovery, which is the blindness the quota probe loop exists to
+			// remove.
+			until := time.Unix(0, node.quotaUntil.Load())
+			g.logger.Info("key quota cooled", "component", "upstream", "event", "key_quota_cooled",
+				"tier", string(tierOf(nodes, g)), "key_id", config.KeyDisplayID(node.key),
+				"retry_after_seconds", int(time.Until(until).Seconds()))
+		}
 	}
 }
 

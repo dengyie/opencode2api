@@ -544,6 +544,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		}
 		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		if err != nil {
+			// Log the reason: this path was silent through v1.5.4, so a body
+			// read cut short by the caller's deadline was indistinguishable
+			// from a genuine upstream failure in the logs.
+			g.logger.Warn("upstream response body read failed", "component", "http", "event", "upstream_body_read_failed",
+				"request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier,
+				"status", resp.StatusCode, "error", err)
 			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
