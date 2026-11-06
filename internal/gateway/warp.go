@@ -164,8 +164,10 @@ func warpFailReason(err error) string {
 // doWARPAttempt sends one prepared request through an acquired WARP exit,
 // feeds the outcome back into the pool, and returns the response with a body
 // that releases the exit when closed. The egress label is returned for
-// telemetry ("warp:<public address>").
-func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL, model string, firstEventTimeout time.Duration) (*http.Response, string, error) {
+// telemetry ("warp:<public address>"). attemptTimeout bounds this one attempt
+// (see doInferenceAttempt); callers pass the gateway's attempt deadline unless
+// they shorten it, as the wall-fast-failover probe does.
+func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL, model string, firstEventTimeout, attemptTimeout time.Duration) (*http.Response, string, error) {
 	lease, err := g.warp.Acquire(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -181,7 +183,7 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 	label := "warp:" + lease.EgressKey()
 	setWarpEgress(ctx, label)
 	diagnostic := isDiagnosticRequest(ctx)
-	resp, err := doInferenceAttempt(owned.client(), req, firstEventTimeout, g.attemptTimeout)
+	resp, err := doInferenceAttempt(owned.client(), req, firstEventTimeout, attemptTimeout)
 	if err != nil {
 		if ctx.Err() == nil && !diagnostic {
 			g.warp.Fail(lease, warpFailReason(err))
@@ -248,10 +250,14 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	}
 	// Empirical-wall fast failover (v1.5.6): same contract as the proxy-backed
 	// walk — while the lane is walled and a Zen key can serve, one attempt is
-	// enough to catch the wall lifting.
+	// enough to catch the wall lifting. The probe is bounded by
+	// wall_probe_timeout_seconds (v1.5.7) so a slow walled exit cannot spend
+	// the key's share of the caller's first-token budget.
+	attemptTimeout := g.attemptTimeout
 	if g.anonWallFastFailover() && slices.Contains(route.KeyTiers, config.TierZen) {
 		limit = min(limit, 1)
-		g.logger.Info("anonymous lane is walled; capping the exit walk for a fast key failover", "component", "upstream", "event", "anon_wall_fast_failover", "request_id", ids.Request, "exits", limit)
+		attemptTimeout = g.wallProbeAttemptTimeout()
+		g.logger.Info("anonymous lane is walled; capping the exit walk for a fast key failover", "component", "upstream", "event", "anon_wall_fast_failover", "request_id", ids.Request, "exits", limit, "attempt_timeout", attemptTimeout.String())
 	}
 	firstEventTimeout := time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds) * time.Second
 	var lastResponse *http.Response
@@ -286,7 +292,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 			}
 			setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, nil)
 			started := time.Now()
-			resp, egress, err := g.doWARPAttempt(ctx, req, baseURL, route.ID, firstEventTimeout)
+			resp, egress, err := g.doWARPAttempt(ctx, req, baseURL, route.ID, firstEventTimeout, attemptTimeout)
 			duration := time.Since(started)
 			if ctx.Err() != nil {
 				lastResponse, lastErr = resp, err

@@ -396,10 +396,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	// Empirical-wall fast failover (v1.5.6): while the lane is 429-walled and
 	// a Zen key can take over, one exit attempt is enough to catch the wall
-	// lifting — the rest of the first-token budget belongs to the keys.
+	// lifting — the rest of the first-token budget belongs to the keys. The
+	// probe itself is bounded by wall_probe_timeout_seconds (v1.5.7): a walled
+	// exit can spend 2–17s before answering, which alone can exhaust the
+	// caller's budget before the key gets its turn.
+	attemptTimeout := g.attemptTimeout
 	if g.anonWallFastFailover() && slices.Contains(route.KeyTiers, config.TierZen) {
 		limit = min(limit, 1)
-		g.logger.Info("anonymous lane is walled; capping the exit walk for a fast key failover", "component", "upstream", "event", "anon_wall_fast_failover", "request_id", ids.Request, "exits", limit)
+		attemptTimeout = g.wallProbeAttemptTimeout()
+		g.logger.Info("anonymous lane is walled; capping the exit walk for a fast key failover", "component", "upstream", "event", "anon_wall_fast_failover", "request_id", ids.Request, "exits", limit, "attempt_timeout", attemptTimeout.String())
 	}
 	proxies := 0
 	attempts := 0
@@ -468,7 +473,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, node.proxy)
 			started := time.Now()
-			resp, err := doInferenceAttempt(g.inferenceClient(node.proxy, baseURL, route.ID), req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
+			resp, err := doInferenceAttempt(g.inferenceClient(node.proxy, baseURL, route.ID), req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, attemptTimeout)
 			duration := time.Since(started)
 			if ctx.Err() != nil {
 				// The parent budget expired while this attempt was in flight. Its
@@ -888,7 +893,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	var resp *http.Response
 	var egress string
 	if useWARP {
-		resp, egress, err = g.doWARPAttempt(ctx, req, baseURL, route.ID, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
+		resp, egress, err = g.doWARPAttempt(ctx, req, baseURL, route.ID, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
 	} else {
 		resp, err = doInferenceAttempt(g.inferenceClient(proxy, baseURL, route.ID), req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
 	}
@@ -990,7 +995,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		var resp *http.Response
 		var egress string
 		if useWARP {
-			resp, egress, err = g.doWARPAttempt(ctx, req, baseURL, route.ID, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
+			resp, egress, err = g.doWARPAttempt(ctx, req, baseURL, route.ID, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
 		} else {
 			resp, err = doInferenceAttempt(g.inferenceClient(proxy, baseURL, route.ID), req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second, g.attemptTimeout)
 		}

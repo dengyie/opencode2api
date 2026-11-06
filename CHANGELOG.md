@@ -4,6 +4,38 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.5.7 (2026-11-07) — bound the walled-lane probe
+
+Follow-up to v1.5.6 from the next day's request log (644 routed, 91.3%
+200). The fast failover works — 418 events, one anon attempt then the key —
+but the probe itself was left at the full 30s attempt budget, and a *walled*
+exit is not a fast exit: measured 429s from the lane took 1.7–21.4s. A single
+request paid 17.1s for the probe and 12.8s for the key, 29.9s of a 30s
+first-token budget, and the caller's gate cut it with 429/499.
+
+### Changed
+
+- `performance.wall_probe_timeout_seconds` (default **5**, 0 = off): the
+  attempt timeout for the one anonymous probe made while the wall fast
+  failover is armed, applied on both the proxy-backed and WARP walks. The
+  probe is now abandoned about 5s in and the key tiers keep ~25s of the
+  caller's budget instead of competing for what is left of it. Requests where
+  the walk is not capped are untouched, so serial exits still get the full
+  `attempt_timeout_seconds`.
+- The `anon_wall_fast_failover` event carries `attempt_timeout` so the
+  remaining budget is visible next to `exits`.
+- `anon_wall_fast_failover` reads "capping the exit walk for a key
+  failover".
+
+### Not addressed
+
+The ~30s 499s with no key leg in `legs` are a different shape: the walk ran
+uncapped (2–5 exits), so by the time the anonymous walk finished no key was
+usable, and the caller's gate took the request first. That is the degenerate
+wall (free tier walling keys and exits together), which the full cap still
+covers by design — this release only stops a *slow probe* from eating the
+key's share when a key can serve.
+
 ## v1.5.6 (2026-11-05) — anonymous-wall fast failover to the key tiers
 
 Production traffic analysis showed the anonymous lane's exit walk defeating

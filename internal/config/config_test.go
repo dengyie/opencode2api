@@ -79,10 +79,31 @@ func TestLoadV150Validation(t *testing.T) {
 		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"quota_probe_seconds":90000}}`,
 		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"max_inflight":-2}}`,
 		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"queue_wait_seconds":4000}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"wall_probe_timeout_seconds":-1}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"wall_probe_timeout_seconds":301}}`,
 	}
 	for i, doc := range bad {
 		if _, err := Load(writeConfig(t, doc)); err == nil {
 			t.Fatalf("case %d must be rejected", i)
 		}
+	}
+}
+
+// The wall probe bound (v1.5.7) defaults to 5s and explicit 0 keeps the full
+// attempt timeout.
+func TestLoadWallProbeTimeout(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"]}`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Performance.WallProbeTimeoutSeconds != 5 {
+		t.Fatalf("default wall_probe_timeout_seconds must be 5, got %d", cfg.Performance.WallProbeTimeoutSeconds)
+	}
+	cfg, err = Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"],"performance":{"wall_probe_timeout_seconds":0}}`))
+	if err != nil {
+		t.Fatalf("explicit zero must load: %v", err)
+	}
+	if cfg.Performance.WallProbeTimeoutSeconds != 0 {
+		t.Fatalf("explicit zero must survive, got %d", cfg.Performance.WallProbeTimeoutSeconds)
 	}
 }

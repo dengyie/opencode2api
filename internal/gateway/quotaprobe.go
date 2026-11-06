@@ -293,6 +293,24 @@ func (g *Gateway) anonWallFastFailover() bool {
 	return g.anonymousLaneWalled() && g.zenNodes.HasUsableNode()
 }
 
+// wallProbeAttemptTimeout bounds the single anonymous attempt a wall fast
+// failover leaves in place. Production shows a walled exit can take 2–17s to
+// answer 429; when the keys are expected to carry the request, that delay is
+// spent out of the caller's first-token budget and can push an otherwise
+// serviceable request past it (a 17s probe plus a 13s key answer is 30s).
+// performance.wall_probe_timeout_seconds caps the probe so the keys keep the
+// rest of the budget; 0 keeps the full attempt timeout.
+func (g *Gateway) wallProbeAttemptTimeout() time.Duration {
+	probe := time.Duration(g.cfg.Performance.WallProbeTimeoutSeconds) * time.Second
+	if probe <= 0 {
+		return g.attemptTimeout
+	}
+	if g.attemptTimeout > 0 && g.attemptTimeout < probe {
+		return g.attemptTimeout
+	}
+	return probe
+}
+
 // quotaWall reports whether the request's possible lanes are all quota-cooled,
 // and when the first key reopens. The anonymous lane must be unable to take
 // the request — disabled, paused by its breaker, or empirically walled (its

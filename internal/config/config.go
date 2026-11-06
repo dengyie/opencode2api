@@ -275,6 +275,15 @@ type PerformanceConfig struct {
 	// QueueWaitSeconds is how long a request waits for a free inflight slot
 	// when max_inflight is reached. 0 rejects immediately when full.
 	QueueWaitSeconds int `json:"queue_wait_seconds"`
+	// WallProbeTimeoutSeconds bounds the single anonymous exit attempt left to
+	// a request while the empirical wall signal is armed and a Zen key can
+	// serve (see the anonymous-wall fast failover). Production shows a walled
+	// exit can spend 2–17s before returning its 429; the key tier then has to
+	// answer inside the caller's first-token budget, and a slow probe alone
+	// can push an otherwise serviceable request past it. The probe is capped
+	// at this value so the keys keep the rest of the budget. 0 keeps the full
+	// attempt timeout for the probe (the pre-v1.5.7 behavior).
+	WallProbeTimeoutSeconds int `json:"wall_probe_timeout_seconds"`
 }
 
 // AttemptTimeout returns the bound for a single upstream attempt. When
@@ -322,7 +331,7 @@ func Load(path string) (Config, error) {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, HeartbeatSeconds: 15},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, HeartbeatSeconds: 15, WallProbeTimeoutSeconds: 5},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -426,6 +435,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.QueueWaitSeconds < 0 || cfg.Performance.QueueWaitSeconds > 3600 {
 		return Config{}, errors.New("performance.queue_wait_seconds must be between 0 and 3600 (0 rejects immediately when full)")
+	}
+	if cfg.Performance.WallProbeTimeoutSeconds < 0 || cfg.Performance.WallProbeTimeoutSeconds > 300 {
+		return Config{}, errors.New("performance.wall_probe_timeout_seconds must be between 0 and 300 (0 keeps the full attempt timeout for the wall probe)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
