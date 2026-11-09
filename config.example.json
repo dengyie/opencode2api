@@ -39,6 +39,16 @@
     "free_tier_block_seconds": 900,
     "wall_probe_timeout_seconds": 5
   },
+  "tetherpool": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:9100",
+    "service": "opencode2api",
+    "token": "",
+    "timeout_seconds": 10,
+    "rebind_on_wall": false,
+    "rebind_min_interval_seconds": 600,
+    "regions": []
+  },
   "logging": {
     "level": "info",
     "ring_size": 2000,

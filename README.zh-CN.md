@@ -406,6 +406,23 @@ pool+http://127.0.0.1:7891
 
 单次响应头超时不会超过请求总超时。希望慢节点仍能留出回退时间时，可以将它设为小于总超时的值。请求上下文过期后会停止后续尝试，不会惩罚尚未实际使用的 Key 或代理。
 
+### TetherPool 出口（可选，Mode B）
+
+`tetherpool.enabled` 为 true 时，网关向 TetherPool（IP-Pool）控制面为每个 Zen key 申请一条粘性出口绑定并各自独立路由；配置的 `proxies` 退居其后的故障备援位。控制面不可达时回退到已配置代理并每五分钟自愈重试，绝不阻塞启动。
+
+| 字段                                     | 默认 / 要求                                                        |
+| ---------------------------------------- | ------------------------------------------------------------------ |
+| `tetherpool.enabled`                     | `false` — 总开关。                                                 |
+| `tetherpool.base_url`                    | `http://127.0.0.1:9100` — 控制面根地址。                           |
+| `tetherpool.service`                     | `opencode2api` — 绑定命名空间。                                    |
+| `tetherpool.token`                       | 空 — 可选 Bearer 凭据，日志自动脱敏。                              |
+| `tetherpool.timeout_seconds`             | `10`（1–120）— 整次解析的总预算。                                  |
+| `tetherpool.rebind_on_wall`              | `false` — 上报 429 配额墙，让绑定轮换到新出口。                    |
+| `tetherpool.rebind_min_interval_seconds` | `600`（60–86400）— 单 key 两次墙期上报的最小间隔。                 |
+| `tetherpool.regions`                     | `[]` — 按 key 序轮转的区域偏好。                                   |
+
+`/healthz` 以可选 `tetherpool` 段渲染分配结果（`mode` 为 `api`、`cache`、`static_fallback` 或 `disabled`）。免费层配额按账号与出口 IP 双维计，墙期换绑只解 IP 侧分量。
+
 ### 日志与管理端
 
 | 字段                          | 默认值或要求                                    |

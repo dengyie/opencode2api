@@ -415,6 +415,23 @@ Use it when the endpoint behind the URL already performs the rotation and the po
 
 The per-attempt header timeout is capped by the request timeout. Set it below the total timeout if a slow upstream should leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or proxies.
 
+### TetherPool egress (optional)
+
+When `tetherpool.enabled` is true, the gateway asks a TetherPool (IP-Pool) control plane to allocate one sticky egress binding per Zen key and routes each key through its own binding; the configured `proxies` trail as failover spares. An unreachable control plane degrades to the configured proxies and self-heals every five minutes; it never blocks startup.
+
+| Field                                    | Default / requirement                                                     |
+| ---------------------------------------- | ------------------------------------------------------------------------- |
+| `tetherpool.enabled`                     | `false` — master switch.                                                  |
+| `tetherpool.base_url`                    | `http://127.0.0.1:9100` — control plane root.                             |
+| `tetherpool.service`                     | `opencode2api` — binding namespace.                                       |
+| `tetherpool.token`                       | empty — optional bearer credential, redacted from logs.                   |
+| `tetherpool.timeout_seconds`             | `10` (1–120) — budget for one whole resolve.                              |
+| `tetherpool.rebind_on_wall`              | `false` — report a 429 wall so the binding rotates to a fresh egress.     |
+| `tetherpool.rebind_min_interval_seconds` | `600` (60–86400) — per-key spacing between wall reports.                  |
+| `tetherpool.regions`                     | `[]` — region preferences cycled by key position.                         |
+
+`/healthz` renders the provision as an optional `tetherpool` section (`mode` is `api`, `cache`, `static_fallback` or `disabled`). The free-tier wall is scoped per account and per egress IP, so a wall-triggered rotation lifts only the IP-side component of the wall.
+
 ### Logging and management
 
 | Field                         | Default / requirement                                         |

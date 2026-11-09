@@ -384,6 +384,23 @@ Usalo quando l'endpoint dietro l'URL esegue già la rotazione e i singoli IP di 
 
 Il timeout degli header per tentativo è limitato dal timeout della richiesta. Impostalo sotto il timeout totale se vuoi lasciare tempo per il fallback in caso di upstream lento. La scadenza del contesto della richiesta interrompe i tentativi successivi senza penalizzare chiavi o proxy non usati.
 
+### Uscita TetherPool (opzionale, Mode B)
+
+Quando `tetherpool.enabled` è true, il gateway chiede al control plane di TetherPool (IP-Pool) di allocare un binding di uscita stabile per ogni Zen key e instrada ciascuna chiave tramite il proprio binding; le `proxies` configurate seguono come riserva di failover. Un control plane non raggiungibile degrada sui proxy configurati e si auto-ripara ogni cinque minuti; non blocca mai l'avvio.
+
+| Campo                                    | Predefinito / requisito                                                 |
+| ---------------------------------------- | ------------------------------------------------------------------------ |
+| `tetherpool.enabled`                     | `false` — interruttore generale.                                         |
+| `tetherpool.base_url`                    | `http://127.0.0.1:9100` — radice del control plane.                      |
+| `tetherpool.service`                     | `opencode2api` — namespace dei binding.                                  |
+| `tetherpool.token`                       | vuoto — credenziale bearer opzionale, oscurata nei log.                  |
+| `tetherpool.timeout_seconds`             | `10` (1–120) — budget per un'intera risoluzione.                         |
+| `tetherpool.rebind_on_wall`              | `false` — segnala un muro 429 così il binding ruota su un'uscita nuova.  |
+| `tetherpool.rebind_min_interval_seconds` | `600` (60–86400) — distanza minima tra le segnalazioni per chiave.       |
+| `tetherpool.regions`                     | `[]` — preferenze di regione, ruotate per posizione della chiave.        |
+
+`/healthz` mostra il provisioning in una sezione `tetherpool` opzionale (`mode` è `api`, `cache`, `static_fallback` o `disabled`). Il limite del tier gratuito è calcolato per account e per IP di uscita, quindi una rotazione innescata dal muro solleva solo la componente lato IP.
+
 ### Log e gestione
 
 | Campo                         | Predefinito / requisito                                  |

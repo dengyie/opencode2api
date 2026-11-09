@@ -4,6 +4,65 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.6.0 (2026-11-10) — TetherPool Mode B integration (optional)
+
+Deep integration with the TetherPool (IP-Pool v2.1) control plane as an
+*optional* egress manager. When enabled, every Zen key gets its own sticky
+egress binding allocated over the REST API and a quota wall on a key can be
+reported back so the control plane rotates that binding to a fresh exit.
+Every failure path degrades to the statically configured proxies, so the
+integration is an enhancement, never a dependency.
+
+### Added
+
+- `tetherpool.*` configuration section (default **disabled**): `base_url`
+  (default `http://127.0.0.1:9100`), `service` (default `opencode2api`),
+  `token` (optional bearer, redacted from logs), `timeout_seconds` (default
+  10, bounds the whole resolve), `rebind_on_wall` (default **false**),
+  `rebind_min_interval_seconds` (default 600) and `regions` (cycled by key
+  position). Range checks bind only while enabled.
+- Startup provisioning (P1): `RuntimeController.build` allocates one binding
+  per Zen key (`oc2api_<display id>`) and leads the proxy list with the
+  returned gateway URLs, so the positional nodePool binding pairs every key
+  with its own egress and the configured proxies trail as failover spares.
+  The resolve is all-or-nothing — a partial list would shift every later
+  key's binding. Bindings are cached per (key, region) for the process
+  lifetime, so config applies do not re-hit the control plane.
+- Static fallback + self-heal (P1): an unreachable control plane keeps the
+  configured proxies (`/healthz` renders `tetherpool.mode =
+  "static_fallback"`) and a background worker retries the resolve every five
+  minutes until it succeeds. A build never fails because of TetherPool.
+- Wall feedback (P1, behind `rebind_on_wall`): a 429 observed on a Zen key —
+  on live traffic or, while a fully walled pool pre-check-blocks every
+  request, on the quota probe's still-walled branch — queues one battery
+  report per key per `rebind_min_interval_seconds`; the dispatch worker POSTs
+  it (`rate_limited_429`, `force_rebind`) so the control plane rotates the
+  binding to a fresh egress. The free-tier wall is scoped per account AND per
+  egress IP, so a rotation lifts only the IP-side component.
+- Observability: events `tetherpool_provisioned`, `tetherpool_fallback`,
+  `tetherpool_reprovision(_failed)`, `tetherpool_rebind(_failed)` and an
+  optional `tetherpool` section in `/healthz` (`mode` plus per-key
+  account/node/region/exit_ip/cached). `static_fallback` is informational
+  and does not affect readiness.
+
+### Behavior compatibility
+
+- With the section absent or `enabled: false`, nothing changes: no new
+  goroutines, no control-plane calls, no healthz section. A config carrying
+  the section requires this binary (`DisallowUnknownFields`), so deploy the
+  binary before enabling.
+- Provisioned entries are injected into the resolved proxy list only; they
+  are never persisted to config.json and the anonymous lane keeps sharing
+  the transports as before.
+
+### Tests
+
+- Hermetic coverage end to end: config defaults/validation, client contract
+  (acquire/battery/token/errors), per-key 1:1 provisioning shape, region
+  cycling, all-or-nothing fallback, cache reuse, build fallback on an
+  unreachable plane, wall-report gating/deduplication and the dispatch
+  worker's battery body. `go test ./... -race -count=1` green.
+
 ## v1.5.7 (2026-11-07) — bound the walled-lane probe
 
 Follow-up to v1.5.6 from the next day's request log (644 routed, 91.3%

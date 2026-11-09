@@ -394,6 +394,23 @@ Dùng khi bản thân endpoint sau URL đã tự luân chuyển, còn từng exi
 
 Timeout header cho mỗi lần thử bị chặn trên bởi timeout của request. Hãy đặt nó thấp hơn timeout tổng nếu muốn một upstream chậm vẫn còn thời gian chuyển sang dự phòng. Context của request đã hết hạn sẽ dừng các lần thử tiếp theo mà không phạt oan key hay proxy chưa dùng.
 
+### Lối ra TetherPool (tùy chọn, Mode B)
+
+Khi `tetherpool.enabled` là true, gateway yêu cầu control plane của TetherPool (IP-Pool) cấp một binding lối ra ổn định cho mỗi Zen key và định tuyến từng key qua binding riêng của nó; các `proxies` đã cấu hình đứng sau làm phương án dự phòng. Control plane không tới được thì lùi về proxy đã cấu hình và tự chữa mỗi năm phút; không bao giờ chặn khởi động.
+
+| Trường                                   | Mặc định / yêu cầu                                                |
+| ---------------------------------------- | ------------------------------------------------------------------ |
+| `tetherpool.enabled`                     | `false` — công tắc chính.                                          |
+| `tetherpool.base_url`                    | `http://127.0.0.1:9100` — gốc control plane.                       |
+| `tetherpool.service`                     | `opencode2api` — namespace của binding.                            |
+| `tetherpool.token`                       | rỗng — bearer credential tùy chọn, được làm mờ trong log.          |
+| `tetherpool.timeout_seconds`             | `10` (1–120) — ngân sách cho toàn bộ một lần resolve.              |
+| `tetherpool.rebind_on_wall`              | `false` — báo tường 429 để binding xoay sang lối ra mới.           |
+| `tetherpool.rebind_min_interval_seconds` | `600` (60–86400) — khoảng cách tối thiểu giữa các báo cáo mỗi key. |
+| `tetherpool.regions`                     | `[]` — ưu tiên vùng, luân phiên theo vị trí key.                   |
+
+`/healthz` hiển thị kết quả cấp phát trong mục `tetherpool` tùy chọn (`mode` là `api`, `cache`, `static_fallback` hoặc `disabled`). Hạn mức miễn phí tính theo cả tài khoản và IP lối ra, nên việc xoay binding khi bị tường chỉ gỡ bỏ phần phụ thuộc IP.
+
 ### Nhật ký và quản trị
 
 | Trường                        | Mặc định / yêu cầu                                     |
