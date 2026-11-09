@@ -53,13 +53,13 @@
 
 `TetherPoolConfig`（挂在 `Performance` 之后）：`enabled` / `base_url`（默认 `http://127.0.0.1:9100`，tebi 走 EasyTier 转发）/ `service`（默认 `opencode2api`）/ `token`（可选 Bearer，进 redactor）/ `timeout_seconds`（默认 10，1–120，整次 resolve 的总预算）/ `rebind_on_wall`（默认 false，上线后实测疗效再开）/ `rebind_min_interval_seconds`（默认 600，60–86400）/ `regions`（按 key 序轮转的区域偏好，空 = 控制面自选）。
 
-`Normalize()`：先补默认再校验；**范围校验仅在 enabled 时生效**——关闭态是惰性死段，不得拒绝遗留值（有测试锁定）。
+`Normalize()`：先补默认再校验；**范围校验仅在 enabled 时生效**——关闭态是惰性死段，不得拒绝遗留值（有测试锁定）。**交叉校验（review 加固）**：`rebind_on_wall` 必须随 `enabled`，否则 worker 不存在、报告落无读通道静默丢弃。
 
 新导出 `Config.WithRuntimeProxies([]string) Config`：克隆并设 `effectiveProxies`，配合 `RuntimeProxies()` 的优先级实现「注入不落盘」。
 
 ### 4.2 控制面 client（internal/tetherpool/client.go）
 
-`NewClient(baseURL, token, timeout)` → `Acquire(ctx, service, accountID, egress, region)`（POST `/v1/allocation/acquire`，region 空则省略参数）/ `BatteryEvent(ctx, BatteryEvent)`（JSON 体）/ `Health(ctx)`。统一 `do()`：`http.NewRequestWithContext` + `httpx.V2UserAgent()` + 2xx 才 decode（`io.LimitReader` 1 MiB）+ 非 2xx 带状态码与 512B 摘要报错。响应只消费 `gateway_proxy_url`（节点信息仅用于观测）。
+`NewClient(baseURL, token, timeout)` → `Acquire(ctx, service, accountID, egress, region)`（POST `/v1/allocation/acquire`，region 空则省略参数）/ `BatteryEvent(ctx, BatteryEvent)`（JSON 体）/ `Health(ctx)`。统一 `do()`：`http.NewRequestWithContext` + `httpx.V2UserAgent()` + 2xx 才 decode（`io.LimitReader` 1 MiB）+ 非 2xx 带状态码与 512B 摘要报错。**query 一律 `url.Values.Encode()`**（review 加固）：account_id 源自任意 key 末 5 位，可能含 `&`/`#`/`%`/空格等非查询安全字符，手拼会打歪请求。响应只消费 `gateway_proxy_url`（节点信息仅用于观测）。
 
 ### 4.3 Provisioner（internal/tetherpool/provision.go）
 
@@ -79,7 +79,7 @@
 
 `build()` 在 `New` 前插入：enabled 时 `Resolve(m.root, cfg, m.logger)` → 成功 `cfg = cfg.WithRuntimeProxies(merged)` + `tetherpool_provisioned` 事件；失败 `tetherpool_fallback`（WARN）保持静态；快照存 `tpSnapshot` 且 enabled 时挂到 `gateway.tpSnapshot`。`New` 后 attach：`gateway.tpRebind = m.tpRebind`（同 rotation :216 模式）。
 
-`rearmTetherPool(cfg)`（对齐 rearmQuotaProbes 三点式：RuntimeManager 尾部 / applyLocked / Shutdown）：enabled 即启动 worker——worker 同时承担 battery 分发与 **5 分钟重试自愈**（快照为 `static_fallback` 时调 `m.Reload()` 重建；reload 会 rearm 本 worker，旧 worker 经 ctx.Done 退出，无栈叠）。
+`rearmTetherPool(cfg)`（对齐 rearmQuotaProbes 三点式：RuntimeManager 尾部 / applyLocked / Shutdown）：enabled 即启动 worker——worker 同时承担 battery 分发与 **重试自愈**（快照为 `static_fallback` 时按 `tpRetryInterval`（默认 5min，controller 字段非包级变量，避免跨 goroutine 竞争）调 `m.Reload()` 重建；reload 会 rearm 本 worker，旧 worker 经 ctx.Done 退出，无栈叠）。**review 加固**：快照仅在 `New()` 成功后才 `Store`——失败的 apply 不得污染 worker 与 healthz 的真相；`Shutdown()` 改持 `updateMu`——cancel 字段（quotaProbe/tp）的读写与 apply/rearm 全程互斥（顺带修掉 pre-existing 的 quotaProbeCancel 同类竞争）。
 
 ### 4.5 墙期反哺（internal/gateway/tetherpool.go + upstream.go + quotaprobe.go + pool.go）
 
@@ -162,6 +162,8 @@ worker 收到即 POST `battery/event{account_id, event_type:rate_limited_429, ta
 | 控制面故障拖慢启动 | resolve 总预算 `timeout_seconds` 封顶；失败即静态回退，build 永不因 TetherPool 失败 |
 | 部分分配导致绑定错位 | all-or-nothing + 进程缓存填槽（有测试锁定） |
 | 换绑风暴 | 单 key 间隔守卫（CAS）+ 容量 64 channel 非阻塞丢弃 + 默认关 |
+| key 末 5 位撞号 → 共享同账号绑定 | Resolve 检出即 WARN（`tetherpool_duplicate_key_id`），语义为共享出口非故障（idempotent acquire）；理论碰撞空间 62^5，现网 6 key 无撞 |
+| healthz（未鉴权）新增 exit_ip/node 暴露 | 评估接受：生产 API 绑 127.0.0.1 回环，WARP 出口为共享段非敏感；与既有 `proxies` 计数段同端点演进 |
 | Reload 重试与用户操作竞争 | worker 经 `m.Reload()`→`Apply` 走 `updateMu`，与 WebUI/管理 API 天然互斥 |
 | gateway_proxy_url 语法耦合 | URL 由控制面返回（不本地拼接）；`validateGatewayURL` 兜底，坏响应按失败回退 |
 | 免费 quota 的账号侧分量不被换绑解除 | 文档明示预期；疗效以 `request_routed` 实测为准，`rebind_on_wall` 默认关 |

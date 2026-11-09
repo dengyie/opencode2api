@@ -104,8 +104,22 @@ func (p *Provisioner) Resolve(ctx context.Context, cfg config.Config, logger *sl
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
+	// Two keys whose last five runes coincide derive the same account and
+	// would silently share one binding (one egress for both). The allocation
+	// is idempotent so nothing breaks, but the egress independence the
+	// integration promises is gone for that pair — say so once per resolve.
+	seen := make(map[string]int, len(keys))
 	for i, key := range keys {
 		displayID := config.KeyDisplayID(key)
+		if first, dup := seen[displayID]; dup {
+			if logger != nil {
+				logger.Warn("tetherpool: duplicate key display id; the keys share one binding",
+					"component", "gateway", "event", "tetherpool_duplicate_key_id",
+					"key_id", displayID, "first_key_index", first, "second_key_index", i)
+			}
+		} else {
+			seen[displayID] = i
+		}
 		region := ""
 		if len(cfg.TetherPool.Regions) > 0 {
 			region = strings.TrimSpace(cfg.TetherPool.Regions[i%len(cfg.TetherPool.Regions)])

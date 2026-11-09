@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/rotation"
+	"opencode2api/internal/telemetry"
 	"opencode2api/internal/tetherpool"
 )
 
@@ -58,7 +60,7 @@ func (cp *tetherCP) batteryCount() int {
 	return len(cp.bodies)
 }
 
-func tetherConfig(t *testing.T, baseURL string) config.Config {
+func tetherConfig(t *testing.T, baseURL string) (config.Config, string) {
 	t.Helper()
 	doc := `{
 		"server_keys": ["sk-local"],
@@ -81,7 +83,7 @@ func tetherConfig(t *testing.T, baseURL string) config.Config {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	return cfg
+	return cfg, path
 }
 
 func quietLogger() *slog.Logger {
@@ -96,7 +98,7 @@ func TestBuildProvisionsTetherPoolBindings(t *testing.T) {
 	server := httptest.NewServer(cp.handler())
 	defer server.Close()
 
-	cfg := tetherConfig(t, server.URL)
+	cfg, _ := tetherConfig(t, server.URL)
 	m := &RuntimeController{root: context.Background(), logger: quietLogger(), tp: tetherpool.NewProvisioner()}
 	runtime, err := m.build(cfg)
 	if err != nil {
@@ -141,7 +143,7 @@ func TestBuildProvisionsTetherPoolBindings(t *testing.T) {
 // A build against an unreachable control plane keeps the configured proxies
 // and reports static_fallback — the degradation, never a failed build.
 func TestBuildFallsBackWhenControlPlaneDown(t *testing.T) {
-	cfg := tetherConfig(t, "http://127.0.0.1:1") // nothing listens here
+	cfg, _ := tetherConfig(t, "http://127.0.0.1:1") // nothing listens here
 	m := &RuntimeController{root: context.Background(), logger: quietLogger(), tp: tetherpool.NewProvisioner()}
 	runtime, err := m.build(cfg)
 	if err != nil {
@@ -161,7 +163,7 @@ func TestBuildFallsBackWhenControlPlaneDown(t *testing.T) {
 func TestBuildReusesCachedBindings(t *testing.T) {
 	cp := &tetherCP{}
 	server := httptest.NewServer(cp.handler())
-	cfg := tetherConfig(t, server.URL)
+	cfg, _ := tetherConfig(t, server.URL)
 	m := &RuntimeController{root: context.Background(), logger: quietLogger(), tp: tetherpool.NewProvisioner()}
 	if _, err := m.build(cfg); err != nil {
 		t.Fatalf("first build: %v", err)
@@ -182,7 +184,7 @@ func TestBuildReusesCachedBindings(t *testing.T) {
 // A live 429 on a Zen key queues exactly one battery report per rebind
 // interval, addressed to the key's TetherPool account.
 func TestObserveQuotaWallFiresBatteryReport(t *testing.T) {
-	cfg := tetherConfig(t, "http://127.0.0.1:1")
+	cfg, _ := tetherConfig(t, "http://127.0.0.1:1")
 	g, err := New(cfg, quietLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("new gateway: %v", err)
@@ -221,7 +223,7 @@ func TestObserveQuotaWallFiresBatteryReport(t *testing.T) {
 // The report is gated on the config switch and on the Zen tier: Go keys and
 // disabled configurations never enqueue.
 func TestObserveQuotaWallGatedByConfig(t *testing.T) {
-	cfg := tetherConfig(t, "http://127.0.0.1:1")
+	cfg, _ := tetherConfig(t, "http://127.0.0.1:1")
 	cfg.TetherPool.RebindOnWall = false
 	g, err := New(cfg, quietLogger(), nil, nil)
 	if err != nil {
@@ -259,7 +261,7 @@ func TestRebindWorkerPostsBatteryEvent(t *testing.T) {
 	server := httptest.NewServer(cp.handler())
 	defer server.Close()
 
-	cfg := tetherConfig(t, server.URL)
+	cfg, _ := tetherConfig(t, server.URL)
 	root, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	m := &RuntimeController{root: root, logger: quietLogger(), tp: tetherpool.NewProvisioner(), tpRebind: make(chan tetherpool.RebindRequest, 8)}
@@ -294,4 +296,94 @@ func proxyName(proxy *proxyTransport) string {
 		return ""
 	}
 	return proxy.name
+}
+
+// The dispatch worker self-heals a static_fallback provision: once the retry
+// interval lapses, it re-applies the config file and the snapshot flips to
+// api with allocated transports — without operator action.
+func TestWorkerRepovisionsAfterFallback(t *testing.T) {
+	cp := &tetherCP{}
+	server := httptest.NewServer(cp.handler())
+	defer server.Close()
+
+	// The config file points at the reachable plane, but the first build runs
+	// against a dead address, simulating a control plane down at startup.
+	cfg, path := tetherConfig(t, server.URL)
+	deadCfg := config.Clone(cfg)
+	deadCfg.TetherPool.BaseURL = "http://127.0.0.1:1"
+	rotationManager, err := rotation.New("", cfg.Rotation)
+	if err != nil {
+		t.Fatalf("rotation: %v", err)
+	}
+	m := &RuntimeController{
+		root: context.Background(), logger: quietLogger(), tp: tetherpool.NewProvisioner(),
+		tpRebind: make(chan tetherpool.RebindRequest, 8), configPath: path,
+		redactor: config.SecretRedactor(), hub: telemetry.LogHub(cfg.Logging.RingSize),
+		level: &slog.LevelVar{}, rotation: rotationManager,
+	}
+	t.Cleanup(m.Shutdown)
+
+	runtime, err := m.build(deadCfg)
+	if err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	m.current.Store(runtime)
+	if runtime.gateway.tpSnapshot == nil || runtime.gateway.tpSnapshot.Mode != tetherpool.ModeStaticFallback {
+		t.Fatalf("first build must fall back, got %+v", runtime.gateway.tpSnapshot)
+	}
+
+	m.tpRetryInterval = 20 * time.Millisecond
+	m.rearmTetherPool(cfg)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if snapshot, ok := m.tpSnapshot.Load().(tetherpool.Snapshot); ok && snapshot.Mode == tetherpool.ModeAPI {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	snapshot, ok := m.tpSnapshot.Load().(tetherpool.Snapshot)
+	if !ok || snapshot.Mode != tetherpool.ModeAPI {
+		t.Fatalf("worker must self-heal to mode api, got %+v", snapshot)
+	}
+	current := m.current.Load()
+	if got := len(current.gateway.transports.items); got != 3 {
+		t.Fatalf("self-healed runtime must carry 2 allocated + 1 spare transports, got %d", got)
+	}
+}
+
+// The runtime's stored config carries the injected proxy list, but a config
+// round-trip through Normalize recomputes the effective list from the
+// configured sources — provisioned entries must never leak into a later
+// apply as if they were static configuration.
+func TestConfigRoundTripDropsProvisionedProxies(t *testing.T) {
+	cp := &tetherCP{}
+	server := httptest.NewServer(cp.handler())
+	defer server.Close()
+
+	cfg, path := tetherConfig(t, server.URL)
+	m := &RuntimeController{root: context.Background(), logger: quietLogger(), tp: tetherpool.NewProvisioner()}
+	runtime, err := m.build(cfg)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := len(runtime.gateway.transports.items); got != 3 {
+		t.Fatalf("precondition: allocated + spare transports, got %d", got)
+	}
+	normalized, err := config.Normalize(path, config.Clone(runtime.config))
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	for _, entry := range normalized.RuntimeProxies() {
+		if strings.Contains(entry, "oc2api_") {
+			t.Fatalf("a config round-trip must not carry provisioned entries, got %q", normalized.RuntimeProxies())
+		}
+	}
+	second, err := m.build(normalized)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := len(second.gateway.transports.items); got != 3 {
+		t.Fatalf("rebuild must not accumulate stale entries, got %d transports", got)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -113,8 +114,31 @@ func TestClientAcquire(t *testing.T) {
 	}
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	if len(cp.requests) != 1 || cp.requests[0] != "POST /v1/allocation/acquire?service=opencode2api&account_id=oc2api_11111&egress_preference=warp_ipv6&region=tokyo" {
+	// url.Values.Encode orders parameters alphabetically.
+	if len(cp.requests) != 1 || cp.requests[0] != "POST /v1/allocation/acquire?account_id=oc2api_11111&egress_preference=warp_ipv6&region=tokyo&service=opencode2api" {
 		t.Fatalf("unexpected request: %q", cp.requests)
+	}
+}
+
+// The account id derives from arbitrary key material: characters that are not
+// query-safe must arrive escaped so the control plane sees one account.
+func TestClientAcquireEscapesAccountID(t *testing.T) {
+	cp := &recordingCP{}
+	server := httptest.NewServer(cp.handler())
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second)
+	rawAccount := "oc2api_a&b#c d%e+f"
+	if _, err := client.Acquire(context.Background(), "opencode2api", rawAccount, "warp_ipv6", ""); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if len(cp.requests) != 1 {
+		t.Fatalf("unexpected request count: %q", cp.requests)
+	}
+	if got := queryParam(cp.requests[0], "account_id"); got != rawAccount {
+		t.Fatalf("control plane must see the raw account id, got %q", got)
 	}
 }
 
@@ -295,6 +319,49 @@ func TestAccountID(t *testing.T) {
 	if got := AccountID("oc_sk_58812127cb89_f6P05ESLALo1yXGcbHF8i-TKANvmy8Lw"); got != "oc2api_my8Lw" {
 		t.Fatalf("account id = %q, want oc2api_my8Lw", got)
 	}
+}
+
+// Two keys whose display ids collide are warned about (they would share one
+// binding) while the resolve itself still succeeds.
+func TestResolveWarnsOnDuplicateDisplayID(t *testing.T) {
+	cp := &recordingCP{}
+	server := httptest.NewServer(cp.handler())
+	defer server.Close()
+
+	cfg := testConfig(t, server.URL)
+	cfg.ZenKeys = []string{"oc_sk_aaa_11111", "oc_sk_bbb_11111"} // same display id
+	var logBuf lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	p := NewProvisioner()
+	entries, _, err := p.Resolve(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("resolve must succeed despite the collision: %v", err)
+	}
+	if !strings.Contains(logBuf.String(), "tetherpool_duplicate_key_id") {
+		t.Fatalf("a duplicate display id must be warned about, log: %s", logBuf.String())
+	}
+	// Both slots carry the same shared binding.
+	if entries[0] != entries[1] {
+		t.Fatalf("colliding keys must share one binding, got %q vs %q", entries[0], entries[1])
+	}
+}
+
+// lockedBuffer is a small io.Writer safe for concurrent use by the provisioner.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func containsBind(entry, account string) bool {

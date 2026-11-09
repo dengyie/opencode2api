@@ -78,6 +78,10 @@ type RuntimeController struct {
 	tpRebind   chan tetherpool.RebindRequest
 	tpSnapshot atomic.Value // tetherpool.Snapshot
 	tpCancel   context.CancelFunc
+	// tpRetryInterval paces the worker's re-provision retries while the
+	// snapshot is static_fallback. Zero uses the 5-minute default; tests
+	// shorten it. Written only before the worker starts.
+	tpRetryInterval time.Duration
 	// warpPool is the pool shared by successive runtimes when the WARP size
 	// and stack are unchanged. warpKey is the identity used for that reuse.
 	warpPool *warp.Pool
@@ -245,11 +249,15 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 		}
 		tpSnapshot = snapshot
 	}
-	m.tpSnapshot.Store(tpSnapshot)
 	gateway, err := New(cfg, m.logger, m.monitor, warpPool)
 	if err != nil {
 		discardWARP()
 		return nil, err
+	}
+	// Only a build that will actually be swapped in updates the worker's view;
+	// a failed apply keeps serving the previous runtime's truth.
+	if cfg.TetherPool.Enabled {
+		m.tpSnapshot.Store(tpSnapshot)
 	}
 	gateway.rotation = m.rotation
 	gateway.tpRebind = m.tpRebind
@@ -504,8 +512,13 @@ func (m *RuntimeController) Reload() (ApplyResult, error) {
 }
 
 // Shutdown stops the free-model availability checks and the current runtime's
-// background loops.
+// background loops. It takes updateMu so it cannot interleave with an apply:
+// the background-loop cancel fields are written by rearm* under that lock,
+// and an in-flight apply (including one triggered by the TetherPool worker's
+// re-provision reload) finishes before the loops are canceled.
 func (m *RuntimeController) Shutdown() {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
 	if m.availabilityCancel != nil {
 		m.availabilityCancel()
 	}

@@ -55,13 +55,33 @@ integration is an enhancement, never a dependency.
   are never persisted to config.json and the anonymous lane keeps sharing
   the transports as before.
 
+### Hardening (post-review)
+
+- `Acquire` builds its query with `url.Values` — the account id derives from
+  arbitrary key material, so characters that are not query-safe must arrive
+  escaped.
+- `tetherpool.rebind_on_wall` without `tetherpool.enabled` is rejected at
+  load: the dispatch worker only exists while the integration is enabled, so
+  the combination would drop every report into an unread channel.
+- The provision snapshot is stored only after the runtime build succeeds; a
+  failed apply no longer overwrites the worker's and `/healthz`'s view.
+- Duplicate key display ids (two keys sharing one account and egress) are
+  warned about at resolve time instead of silently sharing a binding.
+- `Shutdown` takes `updateMu`, so its cancel-field reads cannot interleave
+  with an apply (this also closes the pre-existing window around
+  `quotaProbeCancel`). The re-provision interval moved from a package
+  variable into the controller.
+
 ### Tests
 
 - Hermetic coverage end to end: config defaults/validation, client contract
   (acquire/battery/token/errors), per-key 1:1 provisioning shape, region
   cycling, all-or-nothing fallback, cache reuse, build fallback on an
   unreachable plane, wall-report gating/deduplication and the dispatch
-  worker's battery body. `go test ./... -race -count=1` green.
+  worker's battery body, query escaping, the config round-trip dropping
+  provisioned entries, the duplicate-display-id warning and the worker's
+  self-heal reload from `static_fallback` to `api`. `go test ./... -race
+  -count=1` green.
 
 ## v1.5.7 (2026-11-07) — bound the walled-lane probe
 

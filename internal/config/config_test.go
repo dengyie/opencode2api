@@ -162,6 +162,8 @@ func TestLoadTetherPoolValidation(t *testing.T) {
 		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"timeout_seconds":500}}`,
 		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"rebind_min_interval_seconds":30}}`,
 		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"rebind_min_interval_seconds":100000}}`,
+		// The wall feedback loop has no consumer while the integration is off.
+		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":false,"rebind_on_wall":true}}`,
 	}
 	for i, doc := range bad {
 		if _, err := Load(writeConfig(t, doc)); err == nil {

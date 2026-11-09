@@ -19,8 +19,9 @@ import (
 // tetherpool section take effect on config apply. Any previous worker is
 // canceled first, so repeated applies never stack workers. While the current
 // provision fell back to the static proxies, the worker also retries the
-// resolve every five minutes by re-applying the config file, so a control
-// plane that was down at startup is picked up without operator action.
+// resolve every tpRetryInterval (5 minutes when unset) by re-applying the
+// config file, so a control plane that was down at startup is picked up
+// without operator action.
 func (m *RuntimeController) rearmTetherPool(cfg config.Config) {
 	if m.tpCancel != nil {
 		m.tpCancel()
@@ -40,7 +41,11 @@ func (m *RuntimeController) rearmTetherPool(cfg config.Config) {
 func (m *RuntimeController) runTetherPoolWorker(ctx context.Context, cfg config.Config) {
 	client := tetherpool.NewClient(cfg.TetherPool.BaseURL, cfg.TetherPool.Token, time.Duration(cfg.TetherPool.TimeoutSeconds)*time.Second)
 	service := cfg.TetherPool.Service
-	retry := time.NewTicker(5 * time.Minute)
+	retryInterval := m.tpRetryInterval
+	if retryInterval <= 0 {
+		retryInterval = 5 * time.Minute
+	}
+	retry := time.NewTicker(retryInterval)
 	defer retry.Stop()
 	for {
 		select {

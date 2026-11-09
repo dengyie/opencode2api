@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -61,14 +62,19 @@ func NewClient(baseURL, token string, timeout time.Duration) *Client {
 // Acquire allocates (or idempotently returns) the sticky binding for
 // accountID in service, preferring the requested egress type and region. The
 // control plane creates the binding on first sight and returns the same
-// assignment for every later call, so repeated resolves are safe.
+// assignment for every later call, so repeated resolves are safe. Parameters
+// are query-encoded: the account id derives from arbitrary key material, so
+// it may contain characters that are not query-safe.
 func (c *Client) Acquire(ctx context.Context, service, accountID, egress, region string) (Allocation, error) {
-	query := fmt.Sprintf("/v1/allocation/acquire?service=%s&account_id=%s&egress_preference=%s", service, accountID, egress)
+	query := url.Values{}
+	query.Set("service", service)
+	query.Set("account_id", accountID)
+	query.Set("egress_preference", egress)
 	if region != "" {
-		query += "&region=" + region
+		query.Set("region", region)
 	}
 	var alloc Allocation
-	if err := c.do(ctx, http.MethodPost, query, "", &alloc); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v1/allocation/acquire?"+query.Encode(), "", &alloc); err != nil {
 		return Allocation{}, err
 	}
 	return alloc, nil
