@@ -4,6 +4,25 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.6.1 (2026-11-10) — event names that survive the log redactor
+
+Deploying v1.6.0 surfaced a logging trap: the TetherPool gateway's
+conventional proxy password is the literal string `tetherpool`, and the
+log redactor loads proxy userinfo passwords as secrets — so every event
+named `tetherpool_*` was written to the log as `***_*`. The events fired
+(healthz proved the provision) but were ungreppable by name, which defeats
+the log-driven operations this gateway is run by.
+
+### Changed
+
+- Events renamed to a `tp_` prefix that shares no substring with the
+  proxy credential: `tp_provisioned`, `tp_fallback`, `tp_reprovision`,
+  `tp_reprovision_failed`, `tp_rebind`, `tp_rebind_failed`,
+  `tp_duplicate_key_id`. Messages reworded to avoid the credential too
+  ("bindings provisioned", "egress resolve failed; keeping configured
+  proxies", ...). The `account_id`/`key_id` attributes keep their values:
+  the redactor scrubs whole userinfo strings, not the short display id.
+
 ## v1.6.0 (2026-11-10) — TetherPool Mode B integration (optional)
 
 Deep integration with the TetherPool (IP-Pool v2.1) control plane as an

@@ -77,7 +77,7 @@
 
 `RuntimeController` 增 `tp *tetherpool.Provisioner`、`tpRebind chan tetherpool.RebindRequest`（容量 64，**进程级无条件创建**——首建在 rearm 之前，channel 必须先于 worker 存在）、`tpSnapshot atomic.Value`、`tpCancel`。
 
-`build()` 在 `New` 前插入：enabled 时 `Resolve(m.root, cfg, m.logger)` → 成功 `cfg = cfg.WithRuntimeProxies(merged)` + `tetherpool_provisioned` 事件；失败 `tetherpool_fallback`（WARN）保持静态；快照存 `tpSnapshot` 且 enabled 时挂到 `gateway.tpSnapshot`。`New` 后 attach：`gateway.tpRebind = m.tpRebind`（同 rotation :216 模式）。
+`build()` 在 `New` 前插入：enabled 时 `Resolve(m.root, cfg, m.logger)` → 成功 `cfg = cfg.WithRuntimeProxies(merged)` + `tp_provisioned` 事件；失败 `tp_fallback`（WARN）保持静态；快照存 `tpSnapshot` 且 enabled 时挂到 `gateway.tpSnapshot`。`New` 后 attach：`gateway.tpRebind = m.tpRebind`（同 rotation :216 模式）。
 
 `rearmTetherPool(cfg)`（对齐 rearmQuotaProbes 三点式：RuntimeManager 尾部 / applyLocked / Shutdown）：enabled 即启动 worker——worker 同时承担 battery 分发与 **重试自愈**（快照为 `static_fallback` 时按 `tpRetryInterval`（默认 5min，controller 字段非包级变量，避免跨 goroutine 竞争）调 `m.Reload()` 重建；reload 会 rearm 本 worker，旧 worker 经 ctx.Done 退出，无栈叠）。**review 加固**：快照仅在 `New()` 成功后才 `Store`——失败的 apply 不得污染 worker 与 healthz 的真相；`Shutdown()` 改持 `updateMu`——cancel 字段（quotaProbe/tp）的读写与 apply/rearm 全程互斥（顺带修掉 pre-existing 的 quotaProbeCancel 同类竞争）。
 
@@ -87,7 +87,7 @@
 
 挂点一：`observeKeyResult` 429 分支（live 流量，reason=`live_429`）；挂点二：`probeQuotaKey` 的 `quota_probe_still_walled` 分支（全墙期唯一观察者，reason=`probe_still_walled`）。
 
-worker 收到即 POST `battery/event{account_id, event_type:rate_limited_429, target_service, force_rebind:true}`，结果记 `tetherpool_rebind` / `tetherpool_rebind_failed`。**语义边界**：换绑只解 IP 侧配额分量，账号侧滚动窗口仍需自然流过；疗效靠线上 `request_routed` 观察。
+worker 收到即 POST `battery/event{account_id, event_type:rate_limited_429, target_service, force_rebind:true}`，结果记 `tp_rebind` / `tp_rebind_failed`。**语义边界**：换绑只解 IP 侧配额分量，账号侧滚动窗口仍需自然流过；疗效靠线上 `request_routed` 观察。
 
 ### 4.6 healthz（internal/gateway/health.go）
 
@@ -125,11 +125,14 @@ worker 收到即 POST `battery/event{account_id, event_type:rate_limited_429, ta
 
 | 事件 | 级别 | 场景 |
 |---|---|---|
-| `tetherpool_provisioned` | Info | resolve 成功（带 mode/accounts 数） |
-| `tetherpool_fallback` | Warn | resolve 失败保持静态（带 error） |
-| `tetherpool_reprovision` / `tetherpool_reprovision_failed` | Info / Warn | static_fallback 态 5 分钟重试 |
-| `tetherpool_rebind` / `tetherpool_rebind_failed` | Info / Warn | battery 报告投递结果（带 key_id/reason） |
+| `tp_provisioned` | Info | resolve 成功（带 mode/accounts 数） |
+| `tp_fallback` | Warn | resolve 失败保持静态（带 error） |
+| `tp_reprovision` / `tp_reprovision_failed` | Info / Warn | static_fallback 态 5 分钟重试 |
+| `tp_rebind` / `tp_rebind_failed` | Info / Warn | battery 报告投递结果（带 key_id/reason） |
 | healthz `tetherpool` 段 | — | mode + 逐 key 绑定（account/node/region/exit_ip/cached） |
+
+
+> **v1.6.1 事件名勘误**：v1.6.0 的事件名前缀 `tetherpool_` 与代理 URL 的约定密码字面量相同，被日志 redactor 整词洗成 `***`（生产实测：事件落盘但 `event:"***_provisioned"`，grep 失效）。全部事件改 `tp_` 前缀，消息措辞同步避让。教训入册：**事件名/消息不得包含任何可能成为凭据的字面量**。
 
 ## 7. 测试计划（全部密封）
 
@@ -162,7 +165,7 @@ worker 收到即 POST `battery/event{account_id, event_type:rate_limited_429, ta
 | 控制面故障拖慢启动 | resolve 总预算 `timeout_seconds` 封顶；失败即静态回退，build 永不因 TetherPool 失败 |
 | 部分分配导致绑定错位 | all-or-nothing + 进程缓存填槽（有测试锁定） |
 | 换绑风暴 | 单 key 间隔守卫（CAS）+ 容量 64 channel 非阻塞丢弃 + 默认关 |
-| key 末 5 位撞号 → 共享同账号绑定 | Resolve 检出即 WARN（`tetherpool_duplicate_key_id`），语义为共享出口非故障（idempotent acquire）；理论碰撞空间 62^5，现网 6 key 无撞 |
+| key 末 5 位撞号 → 共享同账号绑定 | Resolve 检出即 WARN（`tp_duplicate_key_id`），语义为共享出口非故障（idempotent acquire）；理论碰撞空间 62^5，现网 6 key 无撞 |
 | healthz（未鉴权）新增 exit_ip/node 暴露 | 评估接受：生产 API 绑 127.0.0.1 回环，WARP 出口为共享段非敏感；与既有 `proxies` 计数段同端点演进 |
 | Reload 重试与用户操作竞争 | worker 经 `m.Reload()`→`Apply` 走 `updateMu`，与 WebUI/管理 API 天然互斥 |
 | gateway_proxy_url 语法耦合 | URL 由控制面返回（不本地拼接）；`validateGatewayURL` 兜底，坏响应按失败回退 |

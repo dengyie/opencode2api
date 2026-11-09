@@ -54,10 +54,10 @@ func (m *RuntimeController) runTetherPoolWorker(ctx context.Context, cfg config.
 		case <-retry.C:
 			if snapshot, ok := m.tpSnapshot.Load().(tetherpool.Snapshot); ok && snapshot.Mode == tetherpool.ModeStaticFallback {
 				if m.logger != nil {
-					m.logger.Info("tetherpool re-provision retry", "component", "gateway", "event", "tetherpool_reprovision")
+					m.logger.Info("egress re-provision retry", "component", "gateway", "event", "tp_reprovision")
 				}
 				if _, err := m.Reload(); err != nil && m.logger != nil {
-					m.logger.Warn("tetherpool re-provision failed", "component", "gateway", "event", "tetherpool_reprovision_failed", "error", err)
+					m.logger.Warn("egress re-provision failed", "component", "gateway", "event", "tp_reprovision_failed", "error", err)
 				}
 			}
 		case ev := <-m.tpRebind:
@@ -71,9 +71,9 @@ func (m *RuntimeController) runTetherPoolWorker(ctx context.Context, cfg config.
 			cancel()
 			if m.logger != nil {
 				if err != nil {
-					m.logger.Warn("tetherpool rebind report failed", "component", "gateway", "event", "tetherpool_rebind_failed", "key_id", ev.KeyID, "reason", ev.Reason, "error", err)
+					m.logger.Warn("egress rebind report failed", "component", "gateway", "event", "tp_rebind_failed", "key_id", ev.KeyID, "reason", ev.Reason, "error", err)
 				} else {
-					m.logger.Info("tetherpool rebind reported", "component", "gateway", "event", "tetherpool_rebind", "key_id", ev.KeyID, "account_id", ev.AccountID, "reason", ev.Reason)
+					m.logger.Info("egress rebind reported", "component", "gateway", "event", "tp_rebind", "key_id", ev.KeyID, "account_id", ev.AccountID, "reason", ev.Reason)
 				}
 			}
 		}

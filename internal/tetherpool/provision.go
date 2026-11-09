@@ -113,8 +113,8 @@ func (p *Provisioner) Resolve(ctx context.Context, cfg config.Config, logger *sl
 		displayID := config.KeyDisplayID(key)
 		if first, dup := seen[displayID]; dup {
 			if logger != nil {
-				logger.Warn("tetherpool: duplicate key display id; the keys share one binding",
-					"component", "gateway", "event", "tetherpool_duplicate_key_id",
+				logger.Warn("duplicate key display id; the keys share one binding",
+					"component", "gateway", "event", "tp_duplicate_key_id",
 					"key_id", displayID, "first_key_index", first, "second_key_index", i)
 			}
 		} else {

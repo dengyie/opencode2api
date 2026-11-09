@@ -239,12 +239,12 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 		if err != nil {
 			snapshot = tetherpool.Snapshot{Mode: tetherpool.ModeStaticFallback}
 			if m.logger != nil {
-				m.logger.Warn("tetherpool resolve failed; keeping configured proxies", "component", "gateway", "event", "tetherpool_fallback", "error", err)
+				m.logger.Warn("egress resolve failed; keeping configured proxies", "component", "gateway", "event", "tp_fallback", "error", err)
 			}
 		} else if merged != nil {
 			cfg = cfg.WithRuntimeProxies(merged)
 			if m.logger != nil {
-				m.logger.Info("tetherpool bindings provisioned", "component", "gateway", "event", "tetherpool_provisioned", "mode", snapshot.Mode, "accounts", len(snapshot.Accounts))
+				m.logger.Info("bindings provisioned", "component", "gateway", "event", "tp_provisioned", "mode", snapshot.Mode, "accounts", len(snapshot.Accounts))
 			}
 		}
 		tpSnapshot = snapshot

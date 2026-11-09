@@ -337,7 +337,7 @@ func TestResolveWarnsOnDuplicateDisplayID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve must succeed despite the collision: %v", err)
 	}
-	if !strings.Contains(logBuf.String(), "tetherpool_duplicate_key_id") {
+	if !strings.Contains(logBuf.String(), "tp_duplicate_key_id") {
 		t.Fatalf("a duplicate display id must be warned about, log: %s", logBuf.String())
 	}
 	// Both slots carry the same shared binding.
