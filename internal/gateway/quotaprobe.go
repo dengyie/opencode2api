@@ -156,6 +156,10 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 		// Still walled; the next probe is due after the interval. quotaUntil
 		// already reflects the last real Retry-After, so leave it alone.
 		g.logger.Info("quota probe still walled", "component", "upstream", "event", "quota_probe_still_walled", "tier", tier, "key_id", config.KeyDisplayID(node.key), "model", model)
+		// TetherPool Mode B (v1.6.0): the probe is the only wall observer
+		// while a fully walled pool pre-check-blocks every live request, so
+		// the rebind report rides this branch too (same per-key spacing).
+		g.observeQuotaWall(node, tier, "probe_still_walled")
 	} else {
 		g.logger.Debug("quota probe inconclusive", "component", "upstream", "event", "quota_probe_inconclusive", "tier", tier, "key_id", config.KeyDisplayID(node.key), "reason", result.reason)
 	}

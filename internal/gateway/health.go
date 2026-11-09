@@ -10,6 +10,7 @@ import (
 	"opencode2api/internal/httpx"
 	modelcatalog "opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
+	"opencode2api/internal/tetherpool"
 )
 
 type healthResponse struct {
@@ -20,6 +21,10 @@ type healthResponse struct {
 	Keys    healthKeys    `json:"keys"`
 	Proxies healthProxies `json:"proxies"`
 	Warp    *healthWarp   `json:"warp,omitempty"`
+	// TetherPool reports the Mode B provision state (v1.6.0). It is omitted
+	// when the integration is off so existing readiness consumers see the
+	// same document as before.
+	TetherPool *healthTetherPool `json:"tetherpool,omitempty"`
 	// Load reports the inflight gate's occupancy (v1.5.0). It is omitted when
 	// admission control is disabled so existing readiness consumers see the
 	// same document as before.
@@ -72,6 +77,17 @@ type healthWarp struct {
 	Active  int    `json:"active"`
 	Standby int    `json:"standby"`
 	Cooling int    `json:"cooling"`
+}
+
+// healthTetherPool is the operator view of the Mode B provision. mode is
+// "api" (freshly acquired), "cache" (served from the process cache),
+// "static_fallback" (the control plane could not satisfy every key) or
+// "disabled". static_fallback is informational, not an issue: running on the
+// configured proxies is the documented degradation, not a fault.
+type healthTetherPool struct {
+	Mode      string                  `json:"mode"`
+	Accounts  []tetherpool.KeyBinding `json:"accounts,omitempty"`
+	UpdatedAt *time.Time              `json:"updated_at,omitempty"`
 }
 
 // handleHealth reports readiness. It answers 503 while the model catalog is
@@ -148,6 +164,14 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			status = "starting"
 		}
 	}
+	var tpStatus *healthTetherPool
+	if g.tpSnapshot != nil {
+		tpStatus = &healthTetherPool{Mode: g.tpSnapshot.Mode, Accounts: g.tpSnapshot.Accounts}
+		if !g.tpSnapshot.UpdatedAt.IsZero() {
+			updatedAt := g.tpSnapshot.UpdatedAt
+			tpStatus.UpdatedAt = &updatedAt
+		}
+	}
 	httpx.WriteJSON(w, httpStatus, healthResponse{
 		Status:  status,
 		Ready:   ready,
@@ -169,9 +193,10 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Healthy:   proxyHealthy,
 			Unhealthy: proxyTotal - proxyHealthy,
 		},
-		Warp:   warpStatus,
-		Load:   g.healthLoad(),
-		Issues: issues,
+		Warp:       warpStatus,
+		TetherPool: tpStatus,
+		Load:       g.healthLoad(),
+		Issues:     issues,
 	})
 }
 

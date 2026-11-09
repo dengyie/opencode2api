@@ -36,6 +36,7 @@ import (
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
 	"opencode2api/internal/telemetry"
+	"opencode2api/internal/tetherpool"
 	"opencode2api/internal/warp"
 )
 
@@ -98,6 +99,11 @@ type Gateway struct {
 	// inflight bounds concurrent inference turns (v1.5.0). Nil disables
 	// admission control entirely.
 	inflight *inflightGate
+	// tpRebind (v1.6.0) receives wall-triggered TetherPool battery reports;
+	// sends are gated by tetherpool.rebind_on_wall. tpSnapshot carries the
+	// provision state rendered in /healthz; nil when the integration is off.
+	tpRebind   chan<- tetherpool.RebindRequest
+	tpSnapshot *tetherpool.Snapshot
 	// Empirical anonymous-wall signal (v1.5.3): the anonymous lane answered
 	// 429 free-usage-limit recently. count accumulates within the window and
 	// resets on a 2xx or when the window lapses; it lets the quota pre-check

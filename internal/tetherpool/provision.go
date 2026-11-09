@@ -32,6 +32,19 @@ type RebindRequest struct {
 	Reason    string
 }
 
+// Provision snapshot modes rendered in /healthz.
+const (
+	// ModeDisabled means the integration is off (or there are no Zen keys).
+	ModeDisabled = "disabled"
+	// ModeAPI means every binding was freshly acquired from the control plane.
+	ModeAPI = "api"
+	// ModeCache means at least one binding came from the process cache.
+	ModeCache = "cache"
+	// ModeStaticFallback means the control plane could not satisfy every key
+	// and the gateway is running on the statically configured proxies.
+	ModeStaticFallback = "static_fallback"
+)
+
 // KeyBinding is the resolved state of one Zen key's egress.
 type KeyBinding struct {
 	AccountID string `json:"account_id"`
@@ -144,9 +157,9 @@ func (p *Provisioner) Resolve(ctx context.Context, cfg config.Config, logger *sl
 		entries = append(entries, bindings[i].ProxyURL)
 	}
 	entries = append(entries, cfg.RuntimeProxies()...)
-	mode := "api"
+	mode := ModeAPI
 	if cached > 0 {
-		mode = "cache"
+		mode = ModeCache
 	}
 	return entries, Snapshot{Mode: mode, Accounts: bindings, UpdatedAt: time.Now().UTC()}, nil
 }

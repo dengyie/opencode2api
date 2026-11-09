@@ -612,6 +612,9 @@ type upstreamNode struct {
 	// again with one minimal real request.
 	quotaUntil  atomic.Int64
 	probeNextAt atomic.Int64
+	// rebindFiredAt (v1.6.0) is the last wall-triggered TetherPool battery
+	// report for this key, spacing reports rebind_min_interval_seconds apart.
+	rebindFiredAt atomic.Int64
 }
 
 // upstreamNodes is one tier's key pool. bindingsMu serializes rebinding and

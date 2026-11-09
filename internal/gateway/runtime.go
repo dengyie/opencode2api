@@ -16,6 +16,7 @@ import (
 	"opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
 	"opencode2api/internal/telemetry"
+	"opencode2api/internal/tetherpool"
 	"opencode2api/internal/warp"
 )
 
@@ -69,6 +70,14 @@ type RuntimeController struct {
 	availabilitySweep chan struct{}
 	// quotaProbeCancel stops the quota probe loop (v1.5.0) at Shutdown.
 	quotaProbeCancel context.CancelFunc
+	// tp (v1.6.0) provisions one TetherPool egress binding per Zen key;
+	// tpRebind carries wall-triggered battery reports to the dispatch worker
+	// and tpSnapshot mirrors the provision state the current gateway renders
+	// in /healthz; tpCancel stops the worker at Shutdown and on re-arm.
+	tp         *tetherpool.Provisioner
+	tpRebind   chan tetherpool.RebindRequest
+	tpSnapshot atomic.Value // tetherpool.Snapshot
+	tpCancel   context.CancelFunc
 	// warpPool is the pool shared by successive runtimes when the WARP size
 	// and stack are unchanged. warpKey is the identity used for that reuse.
 	warpPool *warp.Pool
@@ -131,6 +140,11 @@ func RuntimeManager(root context.Context, configPath string, cfg config.Config, 
 		return nil, err
 	}
 	manager.rotation = rotationManager
+	// The provisioner and the rebind channel live for the whole process; the
+	// channel is created unconditionally so the first build can attach it to
+	// the gateway before rearmTetherPool starts the dispatch worker.
+	manager.tp = tetherpool.NewProvisioner()
+	manager.tpRebind = make(chan tetherpool.RebindRequest, 64)
 	runtime, err := manager.build(cfg)
 	if err != nil {
 		return nil, err
@@ -155,6 +169,7 @@ func RuntimeManager(root context.Context, configPath string, cfg config.Config, 
 	manager.metadata.Start(root)
 	manager.startAvailabilityChecks()
 	manager.rearmQuotaProbes(cfg)
+	manager.rearmTetherPool(cfg)
 	return manager, nil
 }
 
@@ -208,12 +223,39 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 			warpPool.Close()
 		}
 	}
+	// TetherPool Mode B (v1.6.0): allocate one sticky egress binding per Zen
+	// key and lead the proxy list with the returned gateway URLs, so
+	// nodePool's positional binding pairs each key with its own binding and
+	// the configured proxies trail as failover spares. Any resolve failure
+	// keeps the configured proxies: the integration degrades, it never fails
+	// the build.
+	tpSnapshot := tetherpool.Snapshot{Mode: tetherpool.ModeDisabled}
+	if cfg.TetherPool.Enabled {
+		merged, snapshot, err := m.tp.Resolve(m.root, cfg, m.logger)
+		if err != nil {
+			snapshot = tetherpool.Snapshot{Mode: tetherpool.ModeStaticFallback}
+			if m.logger != nil {
+				m.logger.Warn("tetherpool resolve failed; keeping configured proxies", "component", "gateway", "event", "tetherpool_fallback", "error", err)
+			}
+		} else if merged != nil {
+			cfg = cfg.WithRuntimeProxies(merged)
+			if m.logger != nil {
+				m.logger.Info("tetherpool bindings provisioned", "component", "gateway", "event", "tetherpool_provisioned", "mode", snapshot.Mode, "accounts", len(snapshot.Accounts))
+			}
+		}
+		tpSnapshot = snapshot
+	}
+	m.tpSnapshot.Store(tpSnapshot)
 	gateway, err := New(cfg, m.logger, m.monitor, warpPool)
 	if err != nil {
 		discardWARP()
 		return nil, err
 	}
 	gateway.rotation = m.rotation
+	gateway.tpRebind = m.tpRebind
+	if cfg.TetherPool.Enabled {
+		gateway.tpSnapshot = &tpSnapshot
+	}
 	availabilityPath := ""
 	if m.configPath != "" {
 		availabilityPath = m.configPath + "." + config.Fingerprint(cfg.Upstream.Zen) + ".availability.json"
@@ -425,6 +467,7 @@ func (m *RuntimeController) applyLocked(candidate config.Config, persist bool) (
 	m.start(next)
 	previous := m.current.Swap(next)
 	m.rearmQuotaProbes(normalized)
+	m.rearmTetherPool(normalized)
 	m.warpPool, m.warpKey = next.warpPool, next.warpKey
 	if previous != nil {
 		previous.cancel()
@@ -468,6 +511,9 @@ func (m *RuntimeController) Shutdown() {
 	}
 	if m.quotaProbeCancel != nil {
 		m.quotaProbeCancel()
+	}
+	if m.tpCancel != nil {
+		m.tpCancel()
 	}
 	if current := m.current.Load(); current != nil {
 		current.cancel()

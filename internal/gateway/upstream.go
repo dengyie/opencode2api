@@ -1090,9 +1090,14 @@ func (g *Gateway) observeKeyResult(ctx context.Context, nodes *upstreamNodes, no
 			// discovery, which is the blindness the quota probe loop exists to
 			// remove.
 			until := time.Unix(0, node.quotaUntil.Load())
+			tier := tierOf(nodes, g)
 			g.logger.Info("key quota cooled", "component", "upstream", "event", "key_quota_cooled",
-				"tier", string(tierOf(nodes, g)), "key_id", config.KeyDisplayID(node.key),
+				"tier", string(tier), "key_id", config.KeyDisplayID(node.key),
 				"retry_after_seconds", int(time.Until(until).Seconds()))
+			// TetherPool Mode B (v1.6.0): report the wall so the control plane
+			// can rotate this key to a fresh egress. Best-effort and spaced by
+			// rebind_min_interval_seconds; a no-op with the integration off.
+			g.observeQuotaWall(node, tier, "live_429")
 		}
 	}
 }
