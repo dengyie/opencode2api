@@ -40,6 +40,7 @@ type Config struct {
 	Retry             RetryConfig                  `json:"retry"`
 	Models            ModelsConfig                 `json:"models"`
 	Performance       PerformanceConfig            `json:"performance"`
+	TetherPool        TetherPoolConfig             `json:"tetherpool"`
 	Logging           LoggingConfig                `json:"logging"`
 	WebUI             WebUIConfig                  `json:"webui"`
 	Prefer            Tier                         `json:"prefer"`
@@ -312,6 +313,84 @@ func (cfg PerformanceConfig) AttemptTimeout(requestTimeout time.Duration) time.D
 	return requestTimeout
 }
 
+// TetherPoolConfig controls the optional TetherPool (IP-Pool) Mode B
+// integration. When enabled, RuntimeController.build asks the TetherPool
+// control plane to allocate one sticky egress binding per Zen key
+// (account "oc2api_<key display id>") and feeds the returned gateway proxy
+// URLs into the proxy transports ahead of the statically configured entries,
+// so nodePool's positional binding pairs every key with its own binding. The
+// control plane keeps the binding authoritative: when the assigned node dies
+// it re-homes the account server-side and the proxy URL itself never changes,
+// so the gateway needs no reconciliation. Every failure path degrades to the
+// static proxy list — the integration is an enhancement, never a dependency.
+type TetherPoolConfig struct {
+	Enabled bool `json:"enabled"`
+	// BaseURL is the control plane root ("http://10.144.144.9:9100" style).
+	// Empty uses the loopback default for a same-mesh EasyTier forward.
+	BaseURL string `json:"base_url"`
+	// Service is the TetherPool namespace the bindings live in, keeping this
+	// deployment's allocations separate from other consumers of the pool.
+	Service string `json:"service"`
+	// Token is the optional bearer credential for control planes that set
+	// IP_POOL_API_TOKEN. It is registered with the log redactor.
+	Token string `json:"token"`
+	// TimeoutSeconds bounds each control plane call (acquire and battery).
+	TimeoutSeconds int `json:"timeout_seconds"`
+	// RebindOnWall turns the wall feedback loop on: when a Zen key observes an
+	// upstream 429 (live traffic or the quota probe), the gateway reports a
+	// rate_limited_429 battery event so TetherPool rotates that binding to a
+	// fresh egress. The free-tier wall is scoped per account AND per egress
+	// IP, so a rotation only lifts the IP-side component; the account-side
+	// window still has to run out. Off by default until the efficacy is
+	// measured in production.
+	RebindOnWall bool `json:"rebind_on_wall"`
+	// RebindMinIntervalSeconds is how long one key waits between wall-triggered
+	// rebind reports, so a wall episode costs at most one event per interval
+	// no matter how many in-flight requests observe the 429.
+	RebindMinIntervalSeconds int `json:"rebind_min_interval_seconds"`
+	// Regions are the region preferences cycled by Zen key position
+	// (key i asks for Regions[i % len]); an empty list leaves the choice to
+	// the control plane. Entries are TetherPool region names ("singapore",
+	// "tokyo", "india", ...) and are not validated here — the control plane
+	// owns the vocabulary.
+	Regions []string `json:"regions"`
+}
+
+// Normalize fills defaults and validates the section. Range checks only bind
+// while the integration is enabled: a disabled section is inert and must not
+// reject a configuration that carries leftover values.
+func (t *TetherPoolConfig) Normalize() error {
+	t.BaseURL = strings.TrimSpace(t.BaseURL)
+	t.Service = strings.TrimSpace(t.Service)
+	trimList(&t.Regions)
+	if t.Service == "" {
+		t.Service = "opencode2api"
+	}
+	if t.BaseURL == "" {
+		t.BaseURL = "http://127.0.0.1:9100"
+	}
+	if t.TimeoutSeconds == 0 {
+		t.TimeoutSeconds = 10
+	}
+	if t.RebindMinIntervalSeconds == 0 {
+		t.RebindMinIntervalSeconds = 600
+	}
+	if !t.Enabled {
+		return nil
+	}
+	u, err := url.Parse(t.BaseURL)
+	if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
+		return errors.New("tetherpool.base_url must be an http or https URL")
+	}
+	if t.TimeoutSeconds < 1 || t.TimeoutSeconds > 120 {
+		return errors.New("tetherpool.timeout_seconds must be between 1 and 120")
+	}
+	if t.RebindMinIntervalSeconds < 60 || t.RebindMinIntervalSeconds > 86400 {
+		return errors.New("tetherpool.rebind_min_interval_seconds must be between 60 and 86400")
+	}
+	return nil
+}
+
 // Load reads the config file at path, strips its // and /* */ comments, and
 // decodes it over the built-in defaults. Decoding is strict: unknown fields
 // and anything after the first JSON value are errors. The result is then
@@ -356,6 +435,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.Warp.Normalize(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.TetherPool.Normalize(); err != nil {
 		return Config{}, err
 	}
 	trimList(&cfg.ServerKeys)
@@ -582,6 +664,16 @@ func (cfg Config) RuntimeProxies() []string {
 	return []string{"direct"}
 }
 
+// WithRuntimeProxies returns a copy of cfg whose resolved proxy list is
+// proxies. RuntimeController.build uses it to feed TetherPool-provisioned
+// entries into gateway.New without persisting them: the effective list is
+// unexported and never encoded, and RuntimeProxies prefers it over the
+// configured Proxies.
+func (cfg Config) WithRuntimeProxies(proxies []string) Config {
+	cfg.effectiveProxies = append([]string(nil), proxies...)
+	return cfg
+}
+
 // PasswordForSave clears the resolved proxy list (the proxies plus proxyfile
 // entries that RuntimeProxies returns), leaving only Config.Proxies; despite
 // its name it does not touch the WebUI password. SaveAtomic calls it on its
@@ -605,6 +697,7 @@ func Clone(cfg Config) Config {
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
 	cfg.Proxies = append([]string(nil), cfg.Proxies...)
+	cfg.TetherPool.Regions = append([]string(nil), cfg.TetherPool.Regions...)
 	cfg.effectiveProxies = append([]string(nil), cfg.effectiveProxies...)
 	if cfg.Models.Protocols != nil {
 		protocols := make(map[string]string, len(cfg.Models.Protocols))

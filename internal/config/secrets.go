@@ -66,6 +66,9 @@ func (r *Redactor) Replace(cfg Config) {
 	values = append(values, cfg.ServerKeys...)
 	values = append(values, cfg.ZenKeys...)
 	values = append(values, cfg.GoKeys...)
+	if cfg.TetherPool.Token != "" {
+		values = append(values, cfg.TetherPool.Token)
+	}
 	if cfg.WebUI.Password != "" {
 		values = append(values, cfg.WebUI.Password)
 	}

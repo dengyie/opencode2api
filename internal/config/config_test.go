@@ -107,3 +107,100 @@ func TestLoadWallProbeTimeout(t *testing.T) {
 		t.Fatalf("explicit zero must survive, got %d", cfg.Performance.WallProbeTimeoutSeconds)
 	}
 }
+
+// A config with no tetherpool section loads and gets the built-in defaults:
+// the integration is off, and the defaulted knobs are ready for a plain flip
+// of enabled.
+func TestLoadDefaultsForTetherPool(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{
+		"server_keys": ["k"],
+		"zen_keys": ["z"]
+	}`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.TetherPool.Enabled {
+		t.Fatal("tetherpool must default to disabled")
+	}
+	if cfg.TetherPool.BaseURL != "http://127.0.0.1:9100" || cfg.TetherPool.Service != "opencode2api" || cfg.TetherPool.TimeoutSeconds != 10 || cfg.TetherPool.RebindMinIntervalSeconds != 600 {
+		t.Fatalf("defaults did not apply: %+v", cfg.TetherPool)
+	}
+}
+
+// The tetherpool fields are accepted and validated, and an enabled section
+// with out-of-range or malformed values is rejected.
+func TestLoadTetherPoolFields(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{
+		"server_keys": ["k"],
+		"zen_keys": ["z"],
+		"tetherpool": {
+			"enabled": true,
+			"base_url": "http://10.144.144.9:9100",
+			"service": "opencode2api",
+			"token": "secret-token",
+			"timeout_seconds": 15,
+			"rebind_on_wall": true,
+			"rebind_min_interval_seconds": 900,
+			"regions": ["singapore", "tokyo", ""]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.TetherPool.Enabled || cfg.TetherPool.BaseURL != "http://10.144.144.9:9100" || cfg.TetherPool.Token != "secret-token" || !cfg.TetherPool.RebindOnWall {
+		t.Fatalf("fields did not round-trip: %+v", cfg.TetherPool)
+	}
+	if len(cfg.TetherPool.Regions) != 2 {
+		t.Fatalf("empty region entries must be dropped, got %q", cfg.TetherPool.Regions)
+	}
+}
+
+func TestLoadTetherPoolValidation(t *testing.T) {
+	bad := []string{
+		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"base_url":"not-a-url"}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"base_url":"ftp://10.144.144.9:9100"}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"timeout_seconds":500}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"rebind_min_interval_seconds":30}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":true,"rebind_min_interval_seconds":100000}}`,
+	}
+	for i, doc := range bad {
+		if _, err := Load(writeConfig(t, doc)); err == nil {
+			t.Fatalf("case %d must be rejected", i)
+		}
+	}
+	// A disabled section is inert: leftover values must not reject the config.
+	cfg, err := Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"],"tetherpool":{"enabled":false,"timeout_seconds":500}}`))
+	if err != nil {
+		t.Fatalf("disabled section must not be validated: %v", err)
+	}
+	if cfg.TetherPool.TimeoutSeconds != 500 {
+		t.Fatalf("disabled section values must survive untouched, got %d", cfg.TetherPool.TimeoutSeconds)
+	}
+}
+
+// WithRuntimeProxies feeds the resolved list without touching the configured
+// one, and Clone keeps the provisioned list and regions from aliasing.
+func TestWithRuntimeProxiesAndClone(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{
+		"server_keys": ["k"],
+		"zen_keys": ["z"],
+		"proxies": ["http://static:1"],
+		"tetherpool": {"regions": ["tokyo"]}
+	}`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	merged := cfg.WithRuntimeProxies([]string{"http://tp-a:1", "http://tp-b:2", "http://static:1"})
+	got := merged.RuntimeProxies()
+	if len(got) != 3 || got[0] != "http://tp-a:1" {
+		t.Fatalf("provisioned proxies must lead the resolved list, got %q", got)
+	}
+	if len(cfg.RuntimeProxies()) != 1 {
+		t.Fatal("WithRuntimeProxies must not mutate the receiver")
+	}
+	clone := Clone(merged)
+	clone.TetherPool.Regions[0] = "india"
+	if merged.TetherPool.Regions[0] != "tokyo" {
+		t.Fatal("Clone must copy TetherPool.Regions")
+	}
+}
