@@ -12,6 +12,13 @@ stream (35.5 MB → 1.58 MB on a ~150 KB, 512-frame SSE stream) at 4.1× the
 throughput, and the v1 Anthropic beta header is derived once per body instead
 of once per key attempt.
 
+A post-deploy review (`3619e90`) found that `performance.pprof_enabled` and
+`performance.memory_limit_bytes` are startup-only settings but were missing
+from the restart-required detection: flipping them in the WebUI reported
+"applied" while silently doing nothing until a restart. They now report
+pending-restart like the listeners, and `GET /api/config`'s `effective` view
+exposes the values the running process actually has.
+
 ### Changed
 
 - **Adaptive encode-buffer pooling** (`internal/jsonutil/encode.go`): `Marshal`

@@ -2,6 +2,9 @@
 
 > 状态：已实现。本文档是 v1.7.3 的函数级设计记录；实现与设计的任何偏差都必须回写本文。
 > 基线：v1.7.2（commit `413f425`）。来源：两轮热路径/内存调研 + 用户选定范围「热路径全套」。
+> 部署后 review 增补（commit `3619e90`）：pprof/memory_limit 为启动期生效字段，`EffectiveListeners`/
+> `RestartStatus`/`applyLocked`/`EffectiveView` 四处补齐，改动经 WebUI 保存后现在会进
+> `restart_required_fields` 提示重启（修复前静默无效）；测试 `runtime_restart_test.go` 锁定。
 
 ## 1. 背景与定位
 
