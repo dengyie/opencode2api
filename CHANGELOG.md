@@ -4,6 +4,42 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.7.2 (2026-11-14) — client masquerade version sync
+
+Tracks the official OpenCode client releases and keeps the v2 lane's
+masquerade version aligned with them, the dynamic-version pattern from
+zcode2api's version tracker. Detection is always on; applying is opt-in.
+
+### Added
+
+- **Client-version tracker** (`internal/gateway/versiontracker.go`): a
+  background loop (default 12h, `performance.version_sync.interval_seconds`)
+  polls the official release feed, parses the newest stable release (exact
+  `v<numeric semver>` tags only — component tags like
+  `process-daemon-v0.5.2`, drafts, and prereleases are ignored), and records
+  the outcome in `/healthz` under `version_sync`.
+- **Atomic v2 version** (`httpx`): `v2ClientVersion` moved behind an atomic
+  with `V2ClientVersion`/`SetV2ClientVersion`; `V2UserAgent` reads it on
+  every render, so an applied update reaches new requests without a restart.
+- **Ceiling clamp**: an auto-applied release never crosses
+  `performance.version_sync.ceiling` (empty = the compile-time claim). The
+  gateway's other fingerprint constants — the v1 client version, Bun
+  runtime, and per-protocol provider-utils pairings — were captured from one
+  release with no public mapping, so a newer claim is unverified. Above-
+  ceiling releases are logged as `version_update_above_ceiling` and marked
+  `pending` in healthz; the operator verifies the release against the v2
+  gates and then raises the ceiling or rebuilds.
+- **Config** (`performance.version_sync`): `interval_seconds` (0 = 12h),
+  `auto_sync` (default false — detect and log only), `ceiling` (must be
+  numeric; a `v` prefix is stripped). Invalid ceilings fail config load
+  rather than silently disabling the clamp.
+
+### Unchanged
+
+- The v1 lane's masquerade is deliberately not auto-synced: its client /
+  Bun / provider-utils version pairing has no public mapping and only a
+  captured request of a real release can provide the next triple.
+
 ## v1.7.1 (2026-11-14) — credential quarantine hardening from the production review
 
 Follow-up to v1.7.0's production code review. No behavior change on the

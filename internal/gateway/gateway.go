@@ -116,6 +116,10 @@ type Gateway struct {
 	// response completed with none. Overrides the capability catalog's
 	// reasoning flag for probe-model selection.
 	observedReasoning sync.Map
+	// versionTracker (v1.7.2) keeps the v2 lane's claimed client version
+	// aligned with the official releases; nil disables the sync loop and
+	// the /healthz report.
+	versionTracker *versionTracker
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -154,6 +158,9 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	catalog := models.Catalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
+	// v1.7.2: the client-version tracker seeds its ceiling from the config
+	// (empty = the compile-time claim), so out of the box auto-sync cannot
+	// claim a release the operator has not verified.
 	warnTimeoutCover(cfg, logger)
 	return &Gateway{
 		cfg:            cfg,
@@ -169,6 +176,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		attemptTimeout: attemptDeadline(cfg),
 		freeTierBlock:  time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
 		inflight:       newInflightGate(cfg.Performance.MaxInflight, cfg.Performance.QueueWaitSeconds),
+		versionTracker: newVersionTracker(cfg.Performance.VersionSync.Ceiling, cfg.Performance.VersionSync.AutoSync),
 	}, nil
 }
 

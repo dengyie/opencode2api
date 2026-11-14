@@ -38,7 +38,12 @@
     "max_anonymous_exits": 8,
     "free_tier_block_seconds": 900,
     "wall_probe_timeout_seconds": 5,
-    "credential_quarantine_seconds": 86400
+    "credential_quarantine_seconds": 86400,
+    "version_sync": {
+      "interval_seconds": 43200,
+      "auto_sync": false,
+      "ceiling": ""
+    }
   },
   "tetherpool": {
     "enabled": false,

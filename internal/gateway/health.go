@@ -25,6 +25,10 @@ type healthResponse struct {
 	// when the integration is off so existing readiness consumers see the
 	// same document as before.
 	TetherPool *healthTetherPool `json:"tetherpool,omitempty"`
+	// VersionSync reports the client-version tracker (v1.7.2). It is omitted
+	// when the tracker is disabled so existing readiness consumers see the
+	// same document as before.
+	VersionSync *versionState `json:"version_sync,omitempty"`
 	// Load reports the inflight gate's occupancy (v1.5.0). It is omitted when
 	// admission control is disabled so existing readiness consumers see the
 	// same document as before.
@@ -197,10 +201,11 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Healthy:   proxyHealthy,
 			Unhealthy: proxyTotal - proxyHealthy,
 		},
-		Warp:       warpStatus,
-		TetherPool: tpStatus,
-		Load:       g.healthLoad(),
-		Issues:     issues,
+		Warp:        warpStatus,
+		TetherPool:  tpStatus,
+		VersionSync: g.VersionState(),
+		Load:        g.healthLoad(),
+		Issues:      issues,
 	})
 }
 

@@ -285,16 +285,37 @@ type PerformanceConfig struct {
 	// at this value so the keys keep the rest of the budget. 0 keeps the full
 	// attempt timeout for the probe (the pre-v1.5.7 behavior).
 	WallProbeTimeoutSeconds int `json:"wall_probe_timeout_seconds"`
-	// CredentialQuarantineSeconds is how long a key stays out of rotation
-	// after the upstream rejected the key itself with a 401/403 (v1.7.0). A
-	// credential rejection is not a transient: the ordinary failure cooldown
-	// would put the dead key back into rotation within minutes, and the last
-	// 401 would reach the caller and get a fronting gateway's channel
-	// auto-disabled. The probe loop re-tests quarantined keys every
-	// quota_probe_seconds, so a revived key returns to service without a
-	// restart. 0 keeps the pre-v1.7 behavior (short cooldown only, 401
-	// passthrough on pool exhaustion).
+	// probe loop re-tests quarantined keys every quota_probe_seconds, so a
+	// revived key returns to service without a restart. 0 keeps the
+	// pre-v1.7 behavior (short cooldown only, 401 passthrough on pool
+	// exhaustion).
 	CredentialQuarantineSeconds int `json:"credential_quarantine_seconds"`
+	// VersionSync (v1.7.2) tracks the official OpenCode client releases and
+	// keeps the v2 lane's masquerade version aligned with them. With
+	// auto_sync off it only detects and logs; auto_sync additionally
+	// rewrites the claimed version. Detection never crosses the ceiling: a
+	// claimed version newer than the release the gateway's other
+	// fingerprint constants were captured from is unverified, so it is
+	// recorded as pending instead of applied.
+	VersionSync VersionSyncConfig `json:"version_sync"`
+}
+
+// VersionSyncConfig tunes the client-version tracker (v1.7.2). The v1 lane's
+// pairing of client version with Bun and provider-utils versions has no
+// public mapping, so the tracker deliberately covers the v2 lane only.
+type VersionSyncConfig struct {
+	// IntervalSeconds is how often the tracker polls the upstream release
+	// feed. 0 uses the built-in 12h default.
+	IntervalSeconds int `json:"interval_seconds"`
+	// AutoSync applies a detected newer release to the v2 User-Agent instead
+	// of only logging it. Auto-applied versions are clamped to Ceiling.
+	AutoSync bool `json:"auto_sync"`
+	// Ceiling is the highest release auto-sync may claim. Empty uses the
+	// compile-time version: an operator must verify a newer release passes
+	// the v2 gates and then raise this value (or the built binary's
+	// constant) before auto-sync may follow upstream. Releases above the
+	// ceiling are logged as detected but never applied.
+	Ceiling string `json:"ceiling"`
 }
 
 // AttemptTimeout returns the bound for a single upstream attempt. When
@@ -540,6 +561,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.Performance.CredentialQuarantineSeconds < 0 || cfg.Performance.CredentialQuarantineSeconds > 2592000 {
 		return Config{}, errors.New("performance.credential_quarantine_seconds must be between 0 and 2592000 (0 restores the legacy plain-cooldown behavior for 401/403)")
 	}
+	if err := validateVersionSync(&cfg.Performance.VersionSync); err != nil {
+		return Config{}, err
+	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
 	}
@@ -657,6 +681,31 @@ func validateEffort(name, value string) error {
 	default:
 		return fmt.Errorf("%s must be one of auto, minimal, low, medium, high, xhigh, max, none, or empty to disable the override", name)
 	}
+}
+
+// validateVersionSync checks the version-sync section. The ceiling is only a
+// masquerade when it is a bare numeric release: a value the tracker cannot
+// compare (or strip a "v" from) would silently disable the clamp.
+func validateVersionSync(vs *VersionSyncConfig) error {
+	if vs.IntervalSeconds < 0 || vs.IntervalSeconds > 604800 {
+		return errors.New("performance.version_sync.interval_seconds must be between 0 and 604800 (0 uses the built-in 12h default)")
+	}
+	vs.Ceiling = strings.TrimSpace(vs.Ceiling)
+	vs.Ceiling = strings.TrimPrefix(strings.TrimPrefix(vs.Ceiling, "v"), "V")
+	if vs.Ceiling == "" {
+		return nil
+	}
+	for _, part := range strings.Split(vs.Ceiling, ".") {
+		if part == "" || len(part) > 9 {
+			return errors.New("performance.version_sync.ceiling must be a numeric release like 2.3.0")
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return errors.New("performance.version_sync.ceiling must be a numeric release like 2.3.0")
+			}
+		}
+	}
+	return nil
 }
 
 // ForcedEffort returns the level the operator forced for a model, or an empty

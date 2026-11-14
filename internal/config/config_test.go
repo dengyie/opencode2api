@@ -206,3 +206,34 @@ func TestWithRuntimeProxiesAndClone(t *testing.T) {
 		t.Fatal("Clone must copy TetherPool.Regions")
 	}
 }
+
+// The version-sync section (v1.7.2) defaults off and only accepts a bare
+// numeric ceiling: a value the tracker cannot compare would silently disable
+// the clamp, so validation rejects it instead.
+func TestLoadVersionSync(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"]}`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Performance.VersionSync.AutoSync || cfg.Performance.VersionSync.IntervalSeconds != 0 || cfg.Performance.VersionSync.Ceiling != "" {
+		t.Fatalf("version_sync must default to detect-only with built-in interval and ceiling, got %+v", cfg.Performance.VersionSync)
+	}
+	cfg, err = Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"],"performance":{"version_sync":{"auto_sync":true,"interval_seconds":3600,"ceiling":"v2.9.0"}}}`))
+	if err != nil {
+		t.Fatalf("explicit version_sync must load: %v", err)
+	}
+	if !cfg.Performance.VersionSync.AutoSync || cfg.Performance.VersionSync.IntervalSeconds != 3600 || cfg.Performance.VersionSync.Ceiling != "2.9.0" {
+		t.Fatalf("version_sync values must survive normalization (ceiling de-v-prefixed), got %+v", cfg.Performance.VersionSync)
+	}
+	bad := []string{
+		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"version_sync":{"interval_seconds":-1}}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"version_sync":{"interval_seconds":700000}}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"version_sync":{"ceiling":"not-a-version"}}}`,
+		`{"server_keys":["k"],"zen_keys":["z"],"performance":{"version_sync":{"ceiling":"2.3.0-beta"}}}`,
+	}
+	for i, doc := range bad {
+		if _, err := Load(writeConfig(t, doc)); err == nil {
+			t.Fatalf("version_sync case %d must be rejected", i)
+		}
+	}
+}

@@ -338,6 +338,7 @@ func (m *RuntimeController) start(runtime *gatewayRuntime) {
 	runtime.cancel = cancel
 	runtime.gateway.StartProxyHealthChecks(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
+	runtime.gateway.StartVersionSync(runtimeCtx)
 }
 
 // Handler returns the API handler, wrapped in the telemetry middleware. Each
