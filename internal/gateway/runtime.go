@@ -94,6 +94,12 @@ type EffectiveListeners struct {
 	API          string
 	WebUI        string
 	WebUIEnabled bool
+	// PprofEnabled and MemoryLimitBytes are v1.7.3 startup-only settings:
+	// the pprof routes mount when Handler() is built and the soft memory
+	// limit is set in main before any runtime exists, so a change waits for
+	// a restart like the listeners do.
+	PprofEnabled     bool
+	MemoryLimitBytes int64
 }
 
 // RuntimeManager builds the RuntimeController for cfg and starts its first
@@ -105,7 +111,8 @@ type EffectiveListeners struct {
 func RuntimeManager(root context.Context, configPath string, cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, hub *telemetry.LogBroker, redactor *config.Redactor, level *slog.LevelVar) (*RuntimeController, error) {
 	manager := &RuntimeController{
 		configPath: configPath, root: root, logger: logger, monitor: monitor, hub: hub, redactor: redactor, level: level,
-		effective: EffectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
+		effective: EffectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled,
+			PprofEnabled: cfg.Performance.PprofEnabled, MemoryLimitBytes: cfg.Performance.MemoryLimitBytes},
 	}
 	manager.metadata = modelcatalog.PricingStore(configPath, logger)
 	// OpenCode metadata refreshes ride the active runtime's healthy proxy
@@ -377,7 +384,7 @@ func (m *RuntimeController) Config() config.Config {
 // differs from them, i.e. the changes waiting for a restart.
 func (m *RuntimeController) RestartStatus() (EffectiveListeners, []string) {
 	cfg := m.Config()
-	fields := make([]string, 0, 3)
+	fields := make([]string, 0, 5)
 	if cfg.Listen != m.effective.API {
 		fields = append(fields, "listen")
 	}
@@ -386,6 +393,12 @@ func (m *RuntimeController) RestartStatus() (EffectiveListeners, []string) {
 	}
 	if cfg.WebUI.Enabled != m.effective.WebUIEnabled {
 		fields = append(fields, "webui.enabled")
+	}
+	if cfg.Performance.PprofEnabled != m.effective.PprofEnabled {
+		fields = append(fields, "performance.pprof_enabled")
+	}
+	if cfg.Performance.MemoryLimitBytes != m.effective.MemoryLimitBytes {
+		fields = append(fields, "performance.memory_limit_bytes")
 	}
 	return m.effective, fields
 }
@@ -464,6 +477,12 @@ func (m *RuntimeController) applyLocked(candidate config.Config, persist bool) (
 	}
 	if normalized.WebUI.Enabled != m.effective.WebUIEnabled {
 		result.RestartFields = append(result.RestartFields, "webui.enabled")
+	}
+	if normalized.Performance.PprofEnabled != m.effective.PprofEnabled {
+		result.RestartFields = append(result.RestartFields, "performance.pprof_enabled")
+	}
+	if normalized.Performance.MemoryLimitBytes != m.effective.MemoryLimitBytes {
+		result.RestartFields = append(result.RestartFields, "performance.memory_limit_bytes")
 	}
 	result.RestartRequired = len(result.RestartFields) > 0
 	m.redactor.Replace(normalized)

@@ -183,11 +183,15 @@ type ConfigView struct {
 }
 
 // EffectiveView is the set of listeners the running process actually bound,
-// which may differ from the configured ones until a restart.
+// which may differ from the configured ones until a restart. The observability
+// knobs are startup-only like the listeners, so their effective values ride
+// along here.
 type EffectiveView struct {
-	Listen       string `json:"listen"`
-	WebUIListen  string `json:"webui_listen"`
-	WebUIEnabled bool   `json:"webui_enabled"`
+	Listen           string `json:"listen"`
+	WebUIListen      string `json:"webui_listen"`
+	WebUIEnabled     bool   `json:"webui_enabled"`
+	PprofEnabled     bool   `json:"pprof_enabled"`
+	MemoryLimitBytes int64  `json:"memory_limit_bytes"`
 }
 
 // WebUIView is the writable part of the WebUI configuration; the password and
@@ -419,9 +423,10 @@ func (a *Server) configView() ConfigView {
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous, Warp: cfg.Warp,
 		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning,
-		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
-		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},
-		Restart:   restart,
+		WebUI: WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
+		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled,
+			PprofEnabled: effective.PprofEnabled, MemoryLimitBytes: effective.MemoryLimitBytes},
+		Restart: restart,
 	}
 }
 
