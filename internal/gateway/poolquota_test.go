@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -240,6 +242,107 @@ func TestCredentialQuarantinedSkippedByNext(t *testing.T) {
 	due := pool.ProbeDueNodes()
 	if len(due) != 3 {
 		t.Fatalf("ProbeDueNodes = %d nodes, want all 3 quarantined keys", len(due))
+	}
+}
+
+// RepinCredentialQuarantine (v1.7.1): a probe that still sees the key rejected
+// while the quarantine is within one probe interval of expiry rolls the wall
+// forward, so a dead key cannot slip back into rotation between probes. Far
+// horizons, expired walls and disabled quarantines are untouched.
+func TestRepinCredentialQuarantine(t *testing.T) {
+	pool := testKeyPool(1, time.Minute)
+	pool.credentialQuarantine = time.Hour
+	node := pool.nodes[0]
+
+	// Near expiry: the wall rolls forward to a fresh stretch.
+	pool.MarkFailure(node, credResponse(http.StatusUnauthorized, ""), nil)
+	node.credUntil.Store(time.Now().Add(30 * time.Second).UnixNano()) // < interval
+	pool.RepinCredentialQuarantine(node)
+	remaining := time.Until(time.Unix(0, node.credUntil.Load()))
+	if remaining < 59*time.Minute {
+		t.Fatalf("near-expiry repin must roll to a fresh stretch, got %v", remaining)
+	}
+	if node.cooldownUntil.Load() < node.credUntil.Load() {
+		t.Fatal("repin must keep cooldownUntil covering credUntil")
+	}
+
+	// A far-out horizon is untouched: the next probe's verdict decides.
+	far := time.Now().Add(3 * time.Hour).UnixNano()
+	node.credUntil.Store(far)
+	pool.RepinCredentialQuarantine(node)
+	if node.credUntil.Load() != far {
+		t.Fatal("repin must not extend a horizon beyond one probe interval away")
+	}
+
+	// An expired wall is not resurrected.
+	node.credUntil.Store(time.Now().Add(-time.Second).UnixNano())
+	pool.RepinCredentialQuarantine(node)
+	if node.credUntil.Load() > time.Now().UnixNano() {
+		t.Fatal("repin must not resurrect an expired quarantine")
+	}
+
+	// Disabled quarantine (0): a no-op even near expiry.
+	disabled := testKeyPool(1, time.Minute)
+	dead := disabled.nodes[0]
+	dead.credUntil.Store(time.Now().Add(30 * time.Second).UnixNano())
+	disabled.RepinCredentialQuarantine(dead)
+	if dead.credUntil.Load() > time.Now().Add(time.Minute).UnixNano() {
+		t.Fatal("repin must be a no-op with the quarantine disabled")
+	}
+}
+
+// The WARP lane scopes a 429 to the exit the pool has just retired: it must
+// not cool or quarantine the key at all (v1.7.1 guard — a reordered check in
+// observeKeyResultWARP would silently quarantine on every exit-level 429).
+func TestWARPResult429DoesNotQuarantine(t *testing.T) {
+	g := &Gateway{logger: testLogger(t)}
+	pool := testKeyPool(1, time.Minute)
+	pool.credentialQuarantine = time.Hour
+	node := pool.nodes[0]
+	g.observeKeyResultWARP(context.Background(), pool, node, quotaResponse("3600"), nil)
+	if node.quotaUntil.Load() != 0 || node.credUntil.Load() != 0 || node.cooldownUntil.Load() != 0 {
+		t.Fatal("a WARP 429 is exit-scoped and must not mark the key")
+	}
+}
+
+// A network-abuse 403 on WARP is likewise scoped to the exit: no quarantine.
+func TestWARPResultAbuse403DoesNotQuarantine(t *testing.T) {
+	g := &Gateway{logger: testLogger(t)}
+	pool := testKeyPool(1, time.Minute)
+	pool.credentialQuarantine = time.Hour
+	node := pool.nodes[0]
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"abusive traffic detected"}}`)),
+	}
+	g.observeKeyResultWARP(context.Background(), pool, node, resp, nil)
+	if node.credUntil.Load() != 0 || node.cooldownUntil.Load() != 0 {
+		t.Fatal("a WARP network-abuse 403 must not quarantine the key")
+	}
+}
+
+// A real credential rejection on WARP quarantines exactly like the direct
+// lane: credUntil pinned to cooldownUntil, probe scheduled, quota untouched.
+func TestWARPResult401Quarantines(t *testing.T) {
+	g := &Gateway{logger: testLogger(t)}
+	pool := testKeyPool(1, time.Minute)
+	pool.credentialQuarantine = time.Hour
+	node := pool.nodes[0]
+	g.observeKeyResultWARP(context.Background(), pool, node, credResponse(http.StatusUnauthorized, ""), nil)
+	if node.credUntil.Load() == 0 || node.credUntil.Load() != node.cooldownUntil.Load() {
+		t.Fatal("a WARP 401 must quarantine the key")
+	}
+	if time.Until(time.Unix(0, node.probeNextAt.Load())) < 55*time.Second {
+		t.Fatalf("probeNextAt must be scheduled one interval out, got %v", time.Until(time.Unix(0, node.probeNextAt.Load())))
+	}
+	if node.quotaUntil.Load() != 0 {
+		t.Fatal("a WARP 401 must not mark quotaUntil")
+	}
+	// A success clears everything, including the credential state.
+	g.observeKeyResultWARP(context.Background(), pool, node, &http.Response{StatusCode: http.StatusOK, Header: http.Header{}}, nil)
+	if node.credUntil.Load() != 0 || node.cooldownUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
+		t.Fatal("a WARP success must clear the quarantine")
 	}
 }
 

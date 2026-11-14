@@ -165,6 +165,7 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 		// left it and the next probe is due after the interval. A dedicated
 		// event keeps a long-quarantined key visible instead of reading as
 		// inconclusive churn.
+		nodes.RepinCredentialQuarantine(node)
 		g.logger.Info("quota probe still credential-dead", "component", "upstream", "event", "quota_probe_still_credential_dead", "tier", tier, "key_id", config.KeyDisplayID(node.key), "model", model, "reason", result.reason)
 	} else {
 		g.logger.Debug("quota probe inconclusive", "component", "upstream", "event", "quota_probe_inconclusive", "tier", tier, "key_id", config.KeyDisplayID(node.key), "reason", result.reason)

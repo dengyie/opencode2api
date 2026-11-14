@@ -221,6 +221,12 @@ func stripStaleReasoningInputs(route models.Route, bodies map[config.Tier][]byte
 func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, models.Route, int, error) {
 	var lastResponse *http.Response
 	var lastErr error
+	// credExhausted pins the v1.7.0 sentinel across tiers: a later tier that
+	// fails with a bare transport error (no HTTP response) must not overwrite
+	// it in lastErr, or the caller sees the generic 502 instead of the
+	// credential-exhausted 503 with its retry guidance. A later tier's real
+	// response still wins — the response-vs-error convention below is intact.
+	credExhausted := false
 	effectiveRoute := route
 	attempts := attemptOffset
 	g.dumpOutboundBodies(route, bodies, ids, attemptOffset)
@@ -317,6 +323,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			lastResponse = resp
 		}
 		if err != nil {
+			if errors.Is(err, errKeyCredentialsExhausted) {
+				credExhausted = true
+			}
 			lastErr = err
 		}
 	}
@@ -331,6 +340,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	}
 	if lastResponse != nil {
 		return lastResponse, effectiveRoute, attempts, nil
+	}
+	if credExhausted {
+		return nil, effectiveRoute, attempts, errKeyCredentialsExhausted
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no usable upstream route")

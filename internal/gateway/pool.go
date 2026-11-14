@@ -1044,6 +1044,39 @@ func (p *upstreamNodes) ProbeDueNodes() []*upstreamNode {
 	return due
 }
 
+// RepinCredentialQuarantine rolls a credential quarantine forward (v1.7.1)
+// when it is about to expire while the probe loop still sees the key rejected.
+// MarkFailure fixes the horizon to one full quarantine stretch; without this,
+// a key the upstream keeps rejecting expires out of the wall between two
+// probes, re-enters rotation, and the next live request re-takes the 401 that
+// synthesizes a 503 — the saw-tooth the quarantine exists to prevent. Because
+// probes run at most one interval apart while a key is walled, expiry always
+// has a probe within the final interval, and this renewal keeps the key out
+// until a probe (or a real request) sees the upstream accept it again.
+func (p *upstreamNodes) RepinCredentialQuarantine(node *upstreamNode) {
+	if p == nil || p.credentialQuarantine <= 0 || p.quotaProbeInterval <= 0 {
+		return
+	}
+	credUntil := node.credUntil.Load()
+	now := time.Now().UnixNano()
+	if credUntil <= now {
+		return
+	}
+	if time.Duration(credUntil-now) > p.quotaProbeInterval {
+		// Expiry is beyond the next probe; that probe's verdict decides.
+		return
+	}
+	until := time.Now().Add(p.credentialQuarantine).UnixNano()
+	if until > credUntil {
+		node.credUntil.Store(until)
+		// Keep the superset invariant MarkFailure maintains: cooldownUntil
+		// covers credUntil so key selection skips it for the same stretch.
+		if node.cooldownUntil.Load() < until {
+			node.cooldownUntil.Store(until)
+		}
+	}
+}
+
 // AllQuotaCooled reports whether every key of this pool is quota-cooled and
 // when the first one reopens. A pool without keys, or with at least one
 // usable key, reports false. The quota pre-check uses this to reject a

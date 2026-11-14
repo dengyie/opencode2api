@@ -45,6 +45,13 @@ func fakeUpstream(t *testing.T, wedged chan struct{}) *httptest.Server {
 		_, _ = w.Write([]byte(`{"opencode":{"id":"opencode","api":"https://opencode.ai/zen","npm":"@ai-sdk/openai-compatible","models":{` +
 			`"big-pickle":{"id":"big-pickle"},` +
 			`"deepseek-v4.1-flash-free":{"id":"deepseek-v4.1-flash-free"},` +
+			`"mimo-v2.6-flash-free":{"id":"mimo-v2.6-flash-free"}}},` +
+			// The Go provider entry keeps the Go tier protocol-supported for
+			// gateways that configure go_keys: once the catalog has refreshed,
+			// tierSupportedLocked consults the per-tier capability data.
+			`"opencode-go":{"id":"opencode-go","api":"https://opencode.ai/go","npm":"@ai-sdk/openai-compatible","models":{` +
+			`"big-pickle":{"id":"big-pickle"},` +
+			`"deepseek-v4.1-flash-free":{"id":"deepseek-v4.1-flash-free"},` +
 			`"mimo-v2.6-flash-free":{"id":"mimo-v2.6-flash-free"}}}}`))
 	})
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
@@ -420,7 +427,11 @@ func credentialFakeUpstream(t *testing.T, healthy *atomic.Bool, calls *atomic.In
 	})
 	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"opencode":{"id":"opencode","api":"https://opencode.ai/zen","npm":"@ai-sdk/openai-compatible","models":{"deepseek-v4.1-flash-free":{"id":"deepseek-v4.1-flash-free"}}}}`))
+		_, _ = w.Write([]byte(`{"opencode":{"id":"opencode","api":"https://opencode.ai/zen","npm":"@ai-sdk/openai-compatible","models":{"deepseek-v4.1-flash-free":{"id":"deepseek-v4.1-flash-free"}}},` +
+			// The Go provider entry keeps the Go tier protocol-supported for
+			// gateways that configure go_keys: once the catalog has refreshed,
+			// tierSupportedLocked consults the per-tier capability data.
+			`"opencode-go":{"id":"opencode-go","api":"https://opencode.ai/go","npm":"@ai-sdk/openai-compatible","models":{"deepseek-v4.1-flash-free":{"id":"deepseek-v4.1-flash-free"}}}}`))
 	})
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -501,8 +512,10 @@ func TestE2ECredentialQuarantineLoop(t *testing.T) {
 		t.Fatal("the 401 must quarantine the key")
 	}
 	retryAfter := respRetryAfter(t, g, "deepseek-v4.1-flash-free")
-	if retryAfter <= 0 {
-		t.Fatalf("Retry-After must name the quarantine horizon, got %d", retryAfter)
+	// The value must name the quarantine horizon: non-zero, never beyond the
+	// configured stretch (v1.7.1 pins the range, not just its existence).
+	if retryAfter < 1 || retryAfter > 7200 {
+		t.Fatalf("Retry-After must be within [1, 7200]s, got %d", retryAfter)
 	}
 
 	// healthz reports the quarantined key (informational, not a readiness block).
@@ -599,5 +612,110 @@ func TestE2ECredentialQuarantineDisabled(t *testing.T) {
 	}
 	if node := g.zenNodes.nodes[0]; node.credUntil.Load() != 0 {
 		t.Fatal("disabled quarantine must not mark credUntil")
+	}
+}
+
+// goDeadPOSTUpstream serves a working model listing for the Go tier (the route
+// planner only includes a tier whose key can list) but terminates every
+// inference POST at the transport layer: the connection is hijacked and
+// closed, so the gateway sees a bare error with no HTTP response — the exact
+// shape that used to overwrite the credential sentinel in lastErr (v1.7.1).
+func goDeadPOSTUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"deepseek-v4.1-flash-free"}]}`))
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "no hijack", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server
+}
+
+// gatewayForTiers is gatewayFor with separate zen/go upstreams and a Go key
+// pool, for tests that exercise the two-tier fallback.
+func gatewayForTiers(t *testing.T, zenURL, goURL, retryJSON, performanceJSON string) *Gateway {
+	t.Helper()
+	doc := `{
+		"listen": "127.0.0.1:0",
+		"server_keys": ["sk-local"],
+		"zen_keys": ["sk-zen"],
+		"go_keys": ["sk-go"],
+		"anonymous": false,
+		"prefer": "zen",
+		"proxies": ["direct"],
+		"upstream": {"zen": "` + zenURL + `", "go": "` + goURL + `"},
+		"retry": ` + retryJSON + `,
+		"models": {"refresh_seconds": 300},
+		"performance": ` + performanceJSON + `
+	}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	cfg.Models.RefreshSeconds = 1
+	origCapabilitiesURL := models.CapabilitiesURL
+	models.CapabilitiesURL = zenURL + "/capabilities"
+	t.Cleanup(func() { models.CapabilitiesURL = origCapabilitiesURL })
+	g, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo})), nil, nil)
+	if err != nil {
+		t.Fatalf("gateway: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	g.StartModelRefresh(ctx)
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(g.catalog.List()) > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(g.catalog.List()) == 0 {
+		t.Fatal("catalog never populated")
+	}
+	return g
+}
+
+// The v1.7.1 sentinel-priority guarantee: when the Zen tier ends in the
+// credential sentinel (all keys 401'd) and the Go tier then fails with a bare
+// transport error — no HTTP response — the caller must still see the
+// credential-exhausted 503, not the generic 502 that the overwritten lastErr
+// used to produce.
+func TestE2ECredentialSentinelSurvivesGoTierFailure(t *testing.T) {
+	var healthy atomic.Bool
+	var calls atomic.Int64
+	zen := credentialFakeUpstream(t, &healthy, &calls)
+	goUpstream := goDeadPOSTUpstream(t)
+	g := gatewayForTiers(t, zen.URL, goUpstream.URL, `{"max_attempts": 2, "timeout_seconds": 30}`, `{"heartbeat_seconds": 0, "quota_probe_seconds": 1, "credential_quarantine_seconds": 7200}`)
+
+	status, body := postChat(t, g.Handler(), "deepseek-v4.1-flash-free")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 key_pool_credential_exhausted (not the generic 502), body: %q", status, body)
+	}
+	if !strings.Contains(body, "key_pool_credential_exhausted") {
+		t.Fatalf("error body must carry the credential-exhausted code: %q", body)
+	}
+	if strings.Contains(body, "Invalid credential") {
+		t.Fatalf("the upstream 401 leaked through: %q", body)
+	}
+	if g.zenNodes.nodes[0].credUntil.Load() == 0 {
+		t.Fatal("the 401 must quarantine the zen key")
 	}
 }

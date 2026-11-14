@@ -4,6 +4,44 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.7.1 (2026-11-14) — credential quarantine hardening from the production review
+
+Follow-up to v1.7.0's production code review. No behavior change on the
+production shape (zen-only pools); the fixes close conditional paths and
+lock them with tests.
+
+### Fixed
+
+- **Sentinel priority across tiers** (`doUpstreamTiers`): when the first key
+  tier ends in the credential sentinel and a later tier fails with a bare
+  transport error (no HTTP response), the sentinel was overwritten in
+  `lastErr` and the caller saw the generic 502 `upstream_error` instead of
+  the credential-exhausted 503 + code `key_pool_credential_exhausted`. The
+  sentinel now survives cross-tier failover (a later tier's real response
+  still wins — the response-over-error convention is intact, and the 401
+  never leaked either way).
+- **Quarantine saw-tooth** (`RepinCredentialQuarantine`): a key the upstream
+  keeps rejecting expired out of the wall between two probes, re-entered
+  rotation, and the next live request re-took the 401 that synthesizes a
+  503. A probe that still sees the key rejected while the quarantine is
+  within one probe interval of expiry now rolls the wall forward, so a
+  dead key stays out until a probe (or a real request) sees the upstream
+  accept it again. A successful probe clears everything as before.
+
+### Tests
+
+- `TestE2ECredentialSentinelSurvivesGoTierFailure`: zen (all 401 → sentinel)
+  + go (transport-level dead POST) two-tier walk; asserts the 503 with the
+  credential-exhausted code — verified to fail with 502 without the fix.
+- WARP lane guards (`TestWARPResult*`): a 429 or network-abuse 403 on the
+  WARP lane must not mark the key at all (exit-scoped), a real 401
+  quarantines exactly like the direct lane, and a success clears it.
+- `TestRepinCredentialQuarantine`: near-expiry rolls forward and keeps
+  `cooldownUntil` covering `credUntil`; far horizons, expired walls and the
+  disabled (`0`) quarantine are untouched.
+- The v1.7.0 E2E now pins the Retry-After range (`1..quarantine_seconds`)
+  instead of only its existence.
+
 ## v1.7.0 (2026-11-14) — key credential quarantine: 401/403 handled inside the pool
 
 The 2026-11-14 production incident: a zen key had been rejected by the
