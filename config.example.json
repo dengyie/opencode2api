@@ -43,7 +43,9 @@
       "interval_seconds": 43200,
       "auto_sync": false,
       "ceiling": ""
-    }
+    },
+    "memory_limit_bytes": 0,
+    "pprof_enabled": false
   },
   "tetherpool": {
     "enabled": false,

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,8 +80,33 @@ func (a *Server) Handler() http.Handler {
 	mux.Handle("POST /api/debug/inference", a.authenticate(a.csrf(http.HandlerFunc(a.handleDebugInference))))
 	mux.Handle("GET /api/logs", a.authenticate(http.HandlerFunc(a.handleLogs)))
 	mux.Handle("GET /api/logs/stream", a.authenticate(http.HandlerFunc(a.handleLogStream)))
+	if cfg := a.manager.Config(); cfg.Performance.PprofEnabled {
+		// The pprof handlers (v1.7.3) mount only when performance.pprof_enabled
+		// asks for them, and only on this admin listener, behind the same
+		// session auth as every other API route: heap and goroutine dumps are
+		// an information disclosure.
+		mux.Handle("/debug/pprof/", a.authenticate(http.HandlerFunc(pprofHandler)))
+	}
 	mux.Handle("/", a.staticHandler())
 	return a.securityHeaders(telemetry.Recover(a.logger, mux))
+}
+
+// pprofHandler dispatches the net/http/pprof endpoints. The package's default
+// mux also serves its own /debug/pprof index; routing each verb explicitly
+// keeps them off the shared DefaultServeMux entirely.
+func pprofHandler(w http.ResponseWriter, r *http.Request) {
+	switch strings.TrimPrefix(r.URL.Path, "/debug/pprof") {
+	case "/cmdline":
+		pprof.Cmdline(w, r)
+	case "/profile":
+		pprof.Profile(w, r)
+	case "/symbol":
+		pprof.Symbol(w, r)
+	case "/trace":
+		pprof.Trace(w, r)
+	default:
+		pprof.Index(w, r)
+	}
 }
 
 // staticHandler serves the embedded WebUI assets, with the index fallback

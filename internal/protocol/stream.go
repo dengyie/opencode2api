@@ -506,8 +506,11 @@ func streamUsageObserver(protocol Protocol) *streamUsageTracker {
 	}}
 }
 
-// Write buffers the relayed bytes and consumes every complete SSE frame they
-// contain, keeping the incomplete tail for the next call. It never fails.
+// Write splits the relayed bytes into complete SSE frames and consumes each
+// one in place, keeping the incomplete tail for the next call. It never fails.
+// The scan is zero-copy: frames are parsed directly out of the retained buffer
+// (the only copy the tracker ever holds), so a long stream costs O(frame) not
+// O(stream).
 func (observer *streamUsageTracker) Write(data []byte) (int, error) {
 	observer.buffer = append(observer.buffer, data...)
 	for {
@@ -515,9 +518,16 @@ func (observer *streamUsageTracker) Write(data []byte) (int, error) {
 		if index < 0 {
 			break
 		}
-		frame := append([]byte(nil), observer.buffer[:index+width]...)
+		observer.consume(observer.buffer[:index+width])
 		observer.buffer = observer.buffer[index+width:]
-		observer.consume(frame)
+	}
+	// Keep the retained tail compact: after consuming frames the buffer holds
+	// only the unterminated tail, but slicing keeps the earlier bytes alive
+	// until the next append reallocates. Copying the small tail forward caps
+	// the retention at the tail's own size.
+	if len(observer.buffer) > 0 {
+		tail := append([]byte(nil), observer.buffer...)
+		observer.buffer = tail
 	}
 	return len(data), nil
 }
@@ -538,32 +548,76 @@ func (observer *streamUsageTracker) ErrorTermination() bool { return observer.er
 
 func (observer *streamUsageTracker) ParseError() error { return observer.parseErr }
 
-// consume parses one complete SSE frame and records its terminal events and
-// usage. A parse error is remembered but not propagated, because the relay
-// must keep copying bytes.
+// consume parses one complete SSE frame in place (frame aliases the retained
+// buffer; it must not be modified or retained) and records its terminal events
+// and usage. A parse error is remembered but not propagated, because the relay
+// must keep copying bytes. The line walk mirrors readSSE's record semantics:
+// a frame ends at its blank line, comments are skipped, event/data prefixes
+// are trimmed, and a record's data lines join with newlines.
 func (observer *streamUsageTracker) consume(frame []byte) {
-	_ = readSSE(strings.NewReader(string(frame)), func(eventName, data string) error {
-		events, err := observer.parser.Parse(eventName, data)
-		if err != nil {
-			if observer.parseErr == nil {
-				observer.parseErr = err
-			}
-			return nil
+	var eventName string
+	var dataLines []string
+	flush := func() {
+		if len(dataLines) == 0 {
+			eventName = ""
+			return
 		}
-		for _, event := range events {
-			switch event.Kind {
-			case "done":
-				observer.normal = true
-			case "error":
-				observer.error = true
-			}
-			if event.Usage != nil {
-				observer.reported = true
-				mergeBridgeUsage(&observer.usage, *event.Usage)
-			}
+		data := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		observer.parseEvent(eventName, data)
+		eventName = ""
+	}
+	for start := 0; start < len(frame); {
+		end := bytes.IndexByte(frame[start:], '\n')
+		if end < 0 {
+			// An SSE frame always ends with a blank line, so a line without a
+			// newline cannot occur in a frame nextSSEBoundary accepted; ignore
+			// it defensively, as readSSE would never deliver it.
+			break
 		}
-		return nil
-	})
+		line := string(frame[start : start+end])
+		start += end + 1
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			flush()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	flush()
+}
+
+// parseEvent feeds one SSE record into the bridge parser and folds the
+// produced bridge events into the tracker state.
+func (observer *streamUsageTracker) parseEvent(eventName, data string) {
+	events, err := observer.parser.Parse(eventName, data)
+	if err != nil {
+		if observer.parseErr == nil {
+			observer.parseErr = err
+		}
+		return
+	}
+	for _, event := range events {
+		switch event.Kind {
+		case "done":
+			observer.normal = true
+		case "error":
+			observer.error = true
+		}
+		if event.Usage != nil {
+			observer.reported = true
+			mergeBridgeUsage(&observer.usage, *event.Usage)
+		}
+	}
 }
 
 // nextSSEBoundary finds the end of the first complete SSE frame in data: it

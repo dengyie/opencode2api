@@ -236,10 +236,19 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	}
 	protocol := route.ProtocolFor(config.TierZen)
 	upstreams := g.anonymousUpstreams()
-	prepared := make([][]byte, len(upstreams))
-	renames := make([]*wire.ToolRenames, len(upstreams))
-	for index, baseURL := range upstreams {
-		prepared[index], renames[index] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL))
+	// Shaping is computed lazily per upstream (see doAnonymousUpstream): a
+	// walk that stops early must not pay to shape bodies it never sent.
+	type shapedBody struct {
+		once    sync.Once
+		body    []byte
+		renames *wire.ToolRenames
+	}
+	shaped := make([]shapedBody, len(upstreams))
+	prepareShaped := func(index int) ([]byte, *wire.ToolRenames) {
+		shaped[index].once.Do(func() {
+			shaped[index].body, shaped[index].renames = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(upstreams[index]))
+		})
+		return shaped[index].body, shaped[index].renames
 	}
 	// A 429 is scoped to the exit that carried it, so the request keeps
 	// rotating exits until the configured attempt budget is spent; only then
@@ -276,7 +285,8 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 			if ctx.Err() != nil {
 				break
 			}
-			setRequestShape(ctx, false, renames[index])
+			prepared, renames := prepareShaped(index)
+			setRequestShape(ctx, false, renames)
 			attempts++
 			if meta := telemetry.MetaFromContext(ctx); meta != nil {
 				meta.Attempts = attemptOffset + attempts
@@ -286,7 +296,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, prepared[index], ids, anonymousZenKey)
+			req, err := upstreamRequest(ctx, baseURL, protocol, prepared, ids, anonymousZenKey)
 			if err != nil {
 				return nil, err, attempts
 			}

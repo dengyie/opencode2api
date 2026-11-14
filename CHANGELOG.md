@@ -4,6 +4,49 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.7.3 (2026-11-14) — hot-path performance and memory optimization
+
+Pure performance and observability release; no external behavior changes.
+Benchmarked results: the stream usage observer allocates 95.6% less per long
+stream (35.5 MB → 1.58 MB on a ~150 KB, 512-frame SSE stream) at 4.1× the
+throughput, and the v1 Anthropic beta header is derived once per body instead
+of once per key attempt.
+
+### Changed
+
+- **Adaptive encode-buffer pooling** (`internal/jsonutil/encode.go`): `Marshal`
+  borrows its buffer from a `sync.Pool` and copies the result out for buffers
+  up to 256 KiB; larger buffers travel with the returned bytes instead of
+  being pooled (copying a megabyte payload per call costs more than a fresh
+  allocation, and pooling one pins megabytes per concurrent request). Small
+  encodes drop one allocation and 20% of bytes per call.
+- **Lazy anonymous-lane shaping** (`internal/gateway/upstream.go`,
+  `internal/gateway/warp.go`): the anonymous exit walk shapes each upstream
+  gate's body on first use (`sync.Once`) instead of pre-shaping every gate
+  before the walk starts, so a walk that stops early never pays for bodies it
+  never sent.
+- **Beta-header cache** (`internal/gateway/upstream.go`): the v1 Anthropic
+  lane's `anthropic-beta` derivation is memoized over the shaped body (a
+  SHA-256-prefix keyed map bounded at 64 entries, least-recently-seen
+  eviction); key rotation replays the same body once per attempt and only the
+  first attempt pays the full typed decode.
+- **Zero-copy stream tracking** (`internal/protocol/stream.go`): the usage
+  observer scans SSE frames in place over the retained buffer instead of
+  copying every frame out and re-reading it through a fresh scanner; the
+  buffer holds only the unterminated tail, so a long stream costs O(frame)
+  memory instead of O(stream).
+
+### Added
+
+- **pprof endpoints** (`internal/admin/server.go`): when
+  `performance.pprof_enabled` is true, the net/http/pprof handlers mount under
+  `/debug/pprof/` on the WebUI admin listener only, behind the same session
+  auth as every other API route. Off by default.
+- **Soft memory limit** (`cmd/opencode2api/main.go`): when
+  `performance.memory_limit_bytes` is positive, the runtime applies
+  `debug.SetMemoryLimit` at startup so GC works harder as total memory
+  approaches the ceiling. 0 keeps the Go default.
+
 ## v1.7.2 (2026-11-14) — client masquerade version sync
 
 Tracks the official OpenCode client releases and keeps the v2 lane's

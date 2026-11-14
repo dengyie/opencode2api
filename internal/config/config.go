@@ -298,6 +298,16 @@ type PerformanceConfig struct {
 	// fingerprint constants were captured from is unverified, so it is
 	// recorded as pending instead of applied.
 	VersionSync VersionSyncConfig `json:"version_sync"`
+	// MemoryLimitBytes (v1.7.3) sets the Go runtime soft memory limit via
+	// debug.SetMemoryLimit at startup: GC works harder as total memory
+	// approaches it instead of letting heap growth hit the container limit.
+	// 0 keeps the Go default (no limit).
+	MemoryLimitBytes int64 `json:"memory_limit_bytes"`
+	// PprofEnabled (v1.7.3) mounts the net/http/pprof handlers under
+	// /debug/pprof/ on the WebUI admin listener, behind its session auth.
+	// Off by default: profiling endpoints on a misconfigured listener are an
+	// information disclosure, so they exist only when asked for.
+	PprofEnabled bool `json:"pprof_enabled"`
 }
 
 // VersionSyncConfig tunes the client-version tracker (v1.7.2). The v1 lane's
@@ -563,6 +573,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if err := validateVersionSync(&cfg.Performance.VersionSync); err != nil {
 		return Config{}, err
+	}
+	if cfg.Performance.MemoryLimitBytes < 0 {
+		return Config{}, errors.New("performance.memory_limit_bytes must not be negative (0 keeps the Go default)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")

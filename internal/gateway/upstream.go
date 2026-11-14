@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode2api/internal/config"
@@ -432,10 +433,22 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// (see shapeKeyBody).
 	protocol := route.ProtocolFor(config.TierZen)
 	upstreams := g.anonymousUpstreams()
-	preparedBodies := make([][]byte, len(upstreams))
-	toolRenames := make([]*wire.ToolRenames, len(upstreams))
-	for i, baseURL := range upstreams {
-		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL))
+	// Shaping is computed lazily per upstream: with several exits listed, each
+	// carries its own gate (v1 /zen vs v2 /inference), but a walk that stops
+	// early should not have paid to shape the bodies it never sent. Today the
+	// list is one entry, so this also removes a parse+encode pass whenever the
+	// walk breaks before its first attempt.
+	type shapedBody struct {
+		once    sync.Once
+		body    []byte
+		renames *wire.ToolRenames
+	}
+	shaped := make([]shapedBody, len(upstreams))
+	prepareShaped := func(index int) ([]byte, *wire.ToolRenames) {
+		shaped[index].once.Do(func() {
+			shaped[index].body, shaped[index].renames = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(upstreams[index]))
+		})
+		return shaped[index].body, shaped[index].renames
 	}
 	for proxies < limit {
 		if ctx.Err() != nil {
@@ -466,7 +479,8 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				}
 				break
 			}
-			setRequestShape(ctx, false, toolRenames[index])
+			prepared, rename := prepareShaped(index)
+			setRequestShape(ctx, false, rename)
 			attempts++
 			if meta := telemetry.MetaFromContext(ctx); meta != nil {
 				meta.Attempts = attemptOffset + attempts
@@ -476,7 +490,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, preparedBodies[index], ids, anonymousZenKey)
+			req, err := upstreamRequest(ctx, baseURL, protocol, prepared, ids, anonymousZenKey)
 			if err != nil {
 				return nil, err, attempts
 			}
@@ -1353,7 +1367,7 @@ func setV1Headers(header http.Header, protocol wire.Protocol, body []byte, ids i
 		header.Set("x-parent-session-id", parent)
 	}
 	if protocol == wire.Anthropic {
-		if betas := v1AnthropicBetas(body); betas != "" {
+		if betas := cachedAnthropicBetas(body); betas != "" {
 			header.Set("anthropic-beta", betas)
 		}
 	}
@@ -1455,6 +1469,57 @@ var v1AnthropicToolBetas = map[string]string{
 	"web_fetch_20260209":      "code-execution-web-tools-2026-02-09",
 	"web_search_20260209":     "code-execution-web-tools-2026-02-09",
 	"advisor_20260301":        "advisor-tool-2026-03-01",
+}
+
+// maxCachedBetaBodies bounds the v1AnthropicBetas cache. Key rotation replays
+// the same shaped body once per attempt, so a small cache removes a full typed
+// decode from every attempt after the first; the eviction follows the
+// least-recently-seen pattern of the telemetry session map.
+const maxCachedBetaBodies = 64
+
+// betaCacheKey is the first 16 bytes of the shaped body's SHA-256: a shaped
+// body is minutes-old gateway output, and a 128-bit prefix collision would
+// need a second preimage, not an accident.
+type betaCacheKey [16]byte
+
+var (
+	betaCacheMu sync.Mutex
+	betaCache   = map[betaCacheKey]string{}
+	betaCacheAt = map[betaCacheKey]int64{}
+)
+
+// cachedAnthropicBetas memoizes v1AnthropicBetas over the shaped body bytes:
+// the betas are a pure function of the body, and every key-tier attempt on a
+// free model re-derives them from identical bytes.
+func cachedAnthropicBetas(body []byte) string {
+	sum := sha256.Sum256(body)
+	var key betaCacheKey
+	copy(key[:], sum[:16])
+	betaCacheMu.Lock()
+	betas, ok := betaCache[key]
+	if ok {
+		betaCacheAt[key] = time.Now().UnixNano()
+	}
+	betaCacheMu.Unlock()
+	if ok {
+		return betas
+	}
+	betas = v1AnthropicBetas(body)
+	betaCacheMu.Lock()
+	if _, exists := betaCache[key]; !exists && len(betaCache) >= maxCachedBetaBodies {
+		victim, oldest := betaCacheKey{}, int64(0)
+		for cached, seen := range betaCacheAt {
+			if oldest == 0 || seen < oldest {
+				victim, oldest = cached, seen
+			}
+		}
+		delete(betaCache, victim)
+		delete(betaCacheAt, victim)
+	}
+	betaCache[key] = betas
+	betaCacheAt[key] = time.Now().UnixNano()
+	betaCacheMu.Unlock()
+	return betas
 }
 
 // v1AnthropicBetas returns the anthropic-beta value OpenCode 1.19.3 sends

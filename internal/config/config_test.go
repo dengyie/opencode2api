@@ -237,3 +237,25 @@ func TestLoadVersionSync(t *testing.T) {
 		}
 	}
 }
+
+// The v1.7.3 observability knobs: memory_limit_bytes defaults to 0 (Go
+// default) and a negative value is rejected; pprof_enabled defaults to off.
+func TestLoadObservability(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"]}`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Performance.MemoryLimitBytes != 0 || cfg.Performance.PprofEnabled {
+		t.Fatalf("observability knobs must default off, got limit=%d pprof=%v", cfg.Performance.MemoryLimitBytes, cfg.Performance.PprofEnabled)
+	}
+	cfg, err = Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"],"performance":{"memory_limit_bytes":268435456,"pprof_enabled":true}}`))
+	if err != nil {
+		t.Fatalf("explicit observability values must load: %v", err)
+	}
+	if cfg.Performance.MemoryLimitBytes != 268435456 || !cfg.Performance.PprofEnabled {
+		t.Fatalf("observability values must survive normalization, got %+v", cfg.Performance)
+	}
+	if _, err := Load(writeConfig(t, `{"server_keys":["k"],"zen_keys":["z"],"performance":{"memory_limit_bytes":-1}}`)); err == nil {
+		t.Fatal("a negative memory limit must be rejected")
+	}
+}

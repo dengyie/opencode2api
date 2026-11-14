@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -40,6 +41,13 @@ func main() {
 	}
 	if *webListen != "" {
 		cfg.WebUI.Listen = *webListen
+	}
+	// The soft memory limit (v1.7.3) steers GC before heap growth reaches the
+	// configured ceiling. 0 keeps the Go default; production sets it only
+	// under a container memory cap.
+	if cfg.Performance.MemoryLimitBytes > 0 {
+		debug.SetMemoryLimit(cfg.Performance.MemoryLimitBytes)
+		slog.Info("soft memory limit applied", "component", "runtime", "event", "memory_limit_set", "bytes", cfg.Performance.MemoryLimitBytes)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
