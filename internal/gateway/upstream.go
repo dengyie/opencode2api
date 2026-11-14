@@ -920,9 +920,12 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 // isNonRetryableClientResponse), which is returned as is so the caller can
 // move on to the next tier; after any other response or transport error the
 // next key is tried. An attempt that finishes after ctx is done ends the loop
-// without being held against the key or the proxy. It returns the last
-// response (body still open), else the last error, plus the number of
-// attempts made.
+// without being held against the key or the proxy. When the tier runs out of
+// keys and the last response was a 401/403 (or every key is already
+// credential-quarantined, v1.7.0), it returns errKeyCredentialsExhausted with
+// a nil response so no upstream status reaches the caller. Otherwise it
+// returns the last response (body still open), else the last error, plus the
+// number of attempts made.
 func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -935,6 +938,16 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	cursor := nodes.CursorFor(ids.Session)
 	if nodes.Len() == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
+	}
+	// v1.7.0: when every key of this tier is credential-quarantined, the
+	// upstream has already judged them all — walking the cursor would only
+	// re-select quarantined keys (Next skips cooled nodes) and end with
+	// nothing tried. Fail the tier with the sentinel so the caller can fall
+	// through to the next tier or synthesize the 503.
+	if nodes.credentialQuarantine > 0 {
+		if _, all := nodes.AllCredentialQuarantined(); all {
+			return nil, errKeyCredentialsExhausted, 0
+		}
 	}
 	attempts := 0
 	body := bodies[route.Tier]
@@ -1059,6 +1072,16 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", proxyLabel, "duration_ms", attemptDuration.Milliseconds())
 		}
 	}
+	// Every key this tier could try rejected the request or failed. A final
+	// 401/403 (v1.7.0) is a credential judgment, not a request judgment: the
+	// handler must synthesize a 503 instead of forwarding it, because a
+	// fronting gateway disables a channel on a 401 while a 503 just cools it.
+	// Other statuses keep the pre-v1.7 passthrough semantics.
+	if lastResponse != nil && nodes.credentialQuarantine > 0 &&
+		(lastResponse.StatusCode == http.StatusUnauthorized || lastResponse.StatusCode == http.StatusForbidden) {
+		httpx.DrainAndClose(lastResponse.Body)
+		return nil, errKeyCredentialsExhausted, attempts
+	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
 	}
@@ -1098,6 +1121,17 @@ func (g *Gateway) observeKeyResult(ctx context.Context, nodes *upstreamNodes, no
 			// can rotate this key to a fresh egress. Best-effort and spaced by
 			// rebind_min_interval_seconds; a no-op with the integration off.
 			g.observeQuotaWall(node, tier, "live_429")
+		}
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && nodes.credentialQuarantine > 0 {
+			// Surface the per-key credential quarantine (v1.7.0): the upstream
+			// rejected the key itself, so the key left rotation for the
+			// configured stretch and the probe loop will re-test it — without
+			// this line a dead key looks like ordinary churn in the log.
+			until := time.Unix(0, node.credUntil.Load())
+			g.logger.Warn("key quarantined on a credential rejection", "component", "upstream", "event", "key_credential_cooled",
+				"tier", string(tierOf(nodes, g)), "key_id", config.KeyDisplayID(node.key),
+				"status", resp.StatusCode,
+				"quarantine_seconds", int(time.Until(until).Seconds()))
 		}
 	}
 }

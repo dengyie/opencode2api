@@ -20,6 +20,9 @@ import (
 // pool stays invisible until then. The loop probes each quota-cooled key at
 // most once per quota_probe_seconds, one probe in flight at a time, and
 // clears the cooldown the moment a probe succeeds.
+// Since v1.7.0 the loop also re-tests credential-quarantined keys (401/403):
+// a quarantined key needs the same active recovery, since the quarantine
+// stretch otherwise outlives any evidence the credential was revived.
 
 // startQuotaProbes runs the quota probe loop on the controller's root context
 // so it survives runtime swaps. Disabled when quota_probe_seconds is zero.
@@ -72,12 +75,9 @@ func (m *RuntimeController) probeQuotaCooledKeys(ctx context.Context) {
 	}
 	g := r.gateway
 	for _, pool := range []*upstreamNodes{g.zenNodes, g.goNodes} {
-		for _, node := range pool.QuotaCooledNodes() {
+		for _, node := range pool.ProbeDueNodes() {
 			if ctx.Err() != nil {
 				return
-			}
-			if time.Now().UnixNano() < node.probeNextAt.Load() {
-				continue
 			}
 			if !quotaProbeInFlight.CompareAndSwap(false, true) {
 				return // one probe at a time; the rest wait for the next tick
@@ -160,6 +160,12 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 		// while a fully walled pool pre-check-blocks every live request, so
 		// the rebind report rides this branch too (same per-key spacing).
 		g.observeQuotaWall(node, tier, "probe_still_walled")
+	} else if result.reason == "http_401" || result.reason == "http_403" {
+		// Still credential-dead (v1.7.0); the quarantine stays as MarkFailure
+		// left it and the next probe is due after the interval. A dedicated
+		// event keeps a long-quarantined key visible instead of reading as
+		// inconclusive churn.
+		g.logger.Info("quota probe still credential-dead", "component", "upstream", "event", "quota_probe_still_credential_dead", "tier", tier, "key_id", config.KeyDisplayID(node.key), "model", model, "reason", result.reason)
 	} else {
 		g.logger.Debug("quota probe inconclusive", "component", "upstream", "event", "quota_probe_inconclusive", "tier", tier, "key_id", config.KeyDisplayID(node.key), "reason", result.reason)
 	}
@@ -344,6 +350,47 @@ func (g *Gateway) quotaWall() (time.Time, bool) {
 	}
 	if goConfigured {
 		until, ok := g.goNodes.AllQuotaCooled()
+		if !ok {
+			return time.Time{}, false
+		}
+		walled = true
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+	if !walled || earliest.IsZero() {
+		return time.Time{}, false
+	}
+	return earliest, true
+}
+
+// credentialWall is quotaWall's credential-class mirror (v1.7.0): whether the
+// request's possible lanes are all credential-quarantined (401/403), and when
+// the first key's quarantine ends. Same lane logic — a possibly usable
+// anonymous lane never pre-checks a request away. Rejecting here costs zero
+// upstream calls, where walking into doKeyUpstream would spend attempts
+// re-selecting keys the upstream already rejected.
+func (g *Gateway) credentialWall() (time.Time, bool) {
+	if g.anonymousLaneAvailable() && !g.anonymousLaneWalled() {
+		return time.Time{}, false
+	}
+	zenConfigured := len(g.cfg.ZenKeys) > 0
+	goConfigured := len(g.cfg.GoKeys) > 0
+	if !zenConfigured && !goConfigured {
+		return time.Time{}, false
+	}
+	walled := false
+	earliest := time.Time{}
+	if zenConfigured {
+		until, ok := g.zenNodes.AllCredentialQuarantined()
+		if !ok {
+			return time.Time{}, false
+		}
+		walled = true
+		earliest = until
+	}
+	if goConfigured {
+		until, ok := g.goNodes.AllCredentialQuarantined()
 		if !ok {
 			return time.Time{}, false
 		}

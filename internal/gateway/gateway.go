@@ -146,6 +146,11 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	quotaProbeInterval := time.Duration(cfg.Performance.QuotaProbeSeconds) * time.Second
 	zenNodes.quotaProbeInterval = quotaProbeInterval
 	goNodes.quotaProbeInterval = quotaProbeInterval
+	// v1.7.0: how long a 401/403 quarantine keeps a key out of rotation; zero
+	// keeps the pre-v1.7 short-cooldown-only behavior.
+	credentialQuarantine := time.Duration(cfg.Performance.CredentialQuarantineSeconds) * time.Second
+	zenNodes.credentialQuarantine = credentialQuarantine
+	goNodes.credentialQuarantine = credentialQuarantine
 	catalog := models.Catalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
@@ -418,6 +423,22 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				g.logger.Warn("request rejected by the quota pre-check", "component", "gateway", "event", "quota_precheck_blocked", "code", "free_usage_limit", "request_id", ids.Request, "model", model, "tier", route.Tier, "retry_after", retryAfter)
 				return
 			}
+			// Credential pre-check (v1.7.0): when every key lane is quarantined
+			// after a 401/403 and the anonymous lane cannot take the request
+			// either, reject with zero upstream calls. The 503 (not a forwarded
+			// 401) keeps a fronting gateway cooling the channel instead of
+			// disabling it, and the Retry-After names the earliest quarantine
+			// end so the next attempt lands after a probe has had its say.
+			if until, walled := g.credentialWall(); walled {
+				retryAfter := int((time.Until(until) + time.Second - 1) / time.Second)
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				w.Header().Set("Retry-After", fmt.Sprint(retryAfter))
+				wire.WriteError(w, external, http.StatusServiceUnavailable, keyPoolCredentialExhaustedMessage, "key_pool_credential_exhausted", ids.Request)
+				g.logger.Warn("request rejected by the credential pre-check", "component", "gateway", "event", "credential_precheck_blocked", "code", "key_pool_credential_exhausted", "request_id", ids.Request, "model", model, "tier", route.Tier, "retry_after", retryAfter)
+				return
+			}
 		}
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
@@ -509,6 +530,22 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			// model problem in the upstream error.
 			if errors.Is(err, errAnonymousLanePaused) {
 				wire.WriteError(w, external, http.StatusServiceUnavailable, anonymousLanePausedMessage, "free_tier_lane_paused", ids.Request)
+				return
+			}
+			// Every key the tier could try ended in a 401/403 (v1.7.0). The
+			// upstream's 401 must not reach the caller — a fronting gateway
+			// disables the channel on it — so synthesize a 503 with the
+			// earliest quarantine end; the probe loop re-tests the keys and
+			// the pool recovers without anyone forwarding an auth failure.
+			if errors.Is(err, errKeyCredentialsExhausted) {
+				if until, quarantined := g.credentialWall(); quarantined {
+					retryAfter := int((time.Until(until) + time.Second - 1) / time.Second)
+					if retryAfter < 1 {
+						retryAfter = 1
+					}
+					w.Header().Set("Retry-After", fmt.Sprint(retryAfter))
+				}
+				wire.WriteError(w, external, http.StatusServiceUnavailable, keyPoolCredentialExhaustedMessage, "key_pool_credential_exhausted", ids.Request)
 				return
 			}
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)

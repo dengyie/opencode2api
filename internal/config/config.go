@@ -285,6 +285,16 @@ type PerformanceConfig struct {
 	// at this value so the keys keep the rest of the budget. 0 keeps the full
 	// attempt timeout for the probe (the pre-v1.5.7 behavior).
 	WallProbeTimeoutSeconds int `json:"wall_probe_timeout_seconds"`
+	// CredentialQuarantineSeconds is how long a key stays out of rotation
+	// after the upstream rejected the key itself with a 401/403 (v1.7.0). A
+	// credential rejection is not a transient: the ordinary failure cooldown
+	// would put the dead key back into rotation within minutes, and the last
+	// 401 would reach the caller and get a fronting gateway's channel
+	// auto-disabled. The probe loop re-tests quarantined keys every
+	// quota_probe_seconds, so a revived key returns to service without a
+	// restart. 0 keeps the pre-v1.7 behavior (short cooldown only, 401
+	// passthrough on pool exhaustion).
+	CredentialQuarantineSeconds int `json:"credential_quarantine_seconds"`
 }
 
 // AttemptTimeout returns the bound for a single upstream attempt. When
@@ -416,7 +426,7 @@ func Load(path string) (Config, error) {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, HeartbeatSeconds: 15, WallProbeTimeoutSeconds: 5},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, HeartbeatSeconds: 15, WallProbeTimeoutSeconds: 5, CredentialQuarantineSeconds: 86400},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -526,6 +536,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.WallProbeTimeoutSeconds < 0 || cfg.Performance.WallProbeTimeoutSeconds > 300 {
 		return Config{}, errors.New("performance.wall_probe_timeout_seconds must be between 0 and 300 (0 keeps the full attempt timeout for the wall probe)")
+	}
+	if cfg.Performance.CredentialQuarantineSeconds < 0 || cfg.Performance.CredentialQuarantineSeconds > 2592000 {
+		return Config{}, errors.New("performance.credential_quarantine_seconds must be between 0 and 2592000 (0 restores the legacy plain-cooldown behavior for 401/403)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")

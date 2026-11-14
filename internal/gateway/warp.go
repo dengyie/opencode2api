@@ -385,4 +385,14 @@ func (g *Gateway) observeKeyResultWARP(ctx context.Context, nodes *upstreamNodes
 		return
 	}
 	nodes.MarkFailure(node, resp, err)
+	if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && nodes.credentialQuarantine > 0 {
+		// Same visibility as the direct lane (v1.7.0): a credential rejection
+		// quarantined the key, so say so instead of leaving the dead key to
+		// look like ordinary WARP-lane churn.
+		until := time.Unix(0, node.credUntil.Load())
+		g.logger.Warn("key quarantined on a credential rejection", "component", "upstream", "event", "key_credential_cooled",
+			"tier", string(tierOf(nodes, g)), "key_id", config.KeyDisplayID(node.key),
+			"status", resp.StatusCode, "egress", "warp",
+			"quarantine_seconds", int(time.Until(until).Seconds()))
+	}
 }

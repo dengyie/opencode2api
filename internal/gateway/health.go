@@ -59,6 +59,10 @@ type healthKeys struct {
 	Go        int  `json:"go"`
 	Total     int  `json:"total"`
 	Anonymous bool `json:"anonymous"`
+	// CredentialQuarantined counts keys currently held out of rotation by a
+	// 401/403 quarantine (v1.7.0). It is informational: a quarantined key is
+	// still probed and returns automatically, so it does not affect ready.
+	CredentialQuarantined int `json:"credential_quarantined"`
 }
 
 type healthProxies struct {
@@ -187,7 +191,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			CacheSource:       models.CacheSource,
 			Stale:             models.Stale,
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous},
+		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous, CredentialQuarantined: len(g.zenNodes.CredentialQuarantinedNodes()) + len(g.goNodes.CredentialQuarantinedNodes())},
 		Proxies: healthProxies{
 			Total:     proxyTotal,
 			Healthy:   proxyHealthy,

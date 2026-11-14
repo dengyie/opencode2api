@@ -30,6 +30,14 @@ func quotaResponse(retryAfter string) *http.Response {
 	return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header}
 }
 
+func credResponse(status int, retryAfter string) *http.Response {
+	header := http.Header{}
+	if retryAfter != "" {
+		header.Set("Retry-After", retryAfter)
+	}
+	return &http.Response{StatusCode: status, Header: header}
+}
+
 // A 429 marks the key quota-cooled with the same instant as its cooldown.
 func TestMarkFailure429MarksQuota(t *testing.T) {
 	pool := testKeyPool(2, 10*time.Minute)
@@ -61,7 +69,9 @@ func TestMarkFailureRetryAfterAdopted(t *testing.T) {
 	}
 }
 
-// A 401/403/5xx cools the key but does not mark quota.
+// A 401/403/5xx cools the key but does not mark quota. A 5xx stays in the
+// plain exponential cooldown (v1.7.0 semantics: only credential rejections
+// quarantine), while a 401/403 quarantines without touching quotaUntil.
 func TestMarkFailureNonQuotaNoQuotaMark(t *testing.T) {
 	pool := testKeyPool(1, 10*time.Minute)
 	node := pool.nodes[0]
@@ -77,7 +87,163 @@ func TestMarkFailureNonQuotaNoQuotaMark(t *testing.T) {
 	}
 }
 
-// MarkSuccess and quota recovery clear the quota state.
+// A 401 quarantines the key: credUntil and cooldownUntil move to the
+// configured quarantine horizon (not the short exponential cooldown),
+// probeNextAt is scheduled, quotaUntil stays untouched, and the failure
+// streak resets so the key returns to a clean state when the quarantine lifts.
+func TestMarkFailure401Quarantines(t *testing.T) {
+	pool := testKeyPool(2, 10*time.Minute)
+	pool.credentialQuarantine = 2 * time.Hour
+	node := pool.nodes[0]
+	pool.MarkFailure(node, &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}}, nil)
+	if node.credUntil.Load() == 0 {
+		t.Fatal("401 must mark credUntil")
+	}
+	if node.credUntil.Load() != node.cooldownUntil.Load() {
+		t.Fatal("401 must pin cooldownUntil to the quarantine instant")
+	}
+	if remaining := time.Until(time.Unix(0, node.credUntil.Load())); remaining < time.Hour+59*time.Minute {
+		t.Fatalf("quarantine must use the configured stretch, got %v", remaining)
+	}
+	if time.Until(time.Unix(0, node.probeNextAt.Load())) < 9*time.Minute {
+		t.Fatalf("probeNextAt must be scheduled one interval out, got %v", time.Until(time.Unix(0, node.probeNextAt.Load())))
+	}
+	if node.quotaUntil.Load() != 0 {
+		t.Fatal("401 must not mark quotaUntil")
+	}
+	if node.failures.Load() != 0 {
+		t.Fatal("the quarantine must reset the failure streak")
+	}
+	// The unrelated key stays healthy.
+	if pool.nodes[1].credUntil.Load() != 0 {
+		t.Fatal("unrelated key must stay unquarantined")
+	}
+}
+
+// A 403 quarantines exactly like a 401.
+func TestMarkFailure403Quarantines(t *testing.T) {
+	pool := testKeyPool(1, 10*time.Minute)
+	pool.credentialQuarantine = time.Hour
+	node := pool.nodes[0]
+	pool.MarkFailure(node, &http.Response{StatusCode: http.StatusForbidden, Header: http.Header{}}, nil)
+	if node.credUntil.Load() == 0 || node.credUntil.Load() != node.cooldownUntil.Load() {
+		t.Fatal("403 must quarantine the key")
+	}
+}
+
+// An upstream Retry-After must not lengthen a credential quarantine: it is
+// meaningless for a dead key and the configured stretch is authoritative.
+func TestMarkFailureCredentialIgnoresRetryAfter(t *testing.T) {
+	pool := testKeyPool(1, 10*time.Minute)
+	pool.credentialQuarantine = time.Hour
+	node := pool.nodes[0]
+	pool.MarkFailure(node, credResponse(http.StatusUnauthorized, "36000"), nil)
+	if remaining := time.Until(time.Unix(0, node.credUntil.Load())); remaining > time.Hour {
+		t.Fatalf("quarantine must ignore a long Retry-After, got %v", remaining)
+	}
+}
+
+// With the quarantine disabled (0, legacy behavior) a 401 only applies the
+// plain cooldown: no credUntil, no probe scheduling.
+func TestMarkFailureCredentialLegacyWhenDisabled(t *testing.T) {
+	pool := testKeyPool(1, 10*time.Minute)
+	node := pool.nodes[0]
+	pool.MarkFailure(node, credResponse(http.StatusUnauthorized, ""), nil)
+	if node.credUntil.Load() != 0 {
+		t.Fatal("disabled quarantine must not mark credUntil")
+	}
+	if node.cooldownUntil.Load() == 0 {
+		t.Fatal("disabled quarantine must still cool the key")
+	}
+	if node.probeNextAt.Load() != 0 {
+		t.Fatal("disabled quarantine must not schedule a probe")
+	}
+}
+
+// MarkSuccess clears the credential quarantine along with the rest of the
+// failure state.
+func TestMarkSuccessClearsCred(t *testing.T) {
+	pool := testKeyPool(1, 10*time.Minute)
+	pool.credentialQuarantine = time.Hour
+	node := pool.nodes[0]
+	pool.MarkFailure(node, credResponse(http.StatusUnauthorized, ""), nil)
+	pool.MarkSuccess(node)
+	if node.credUntil.Load() != 0 || node.cooldownUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
+		t.Fatal("MarkSuccess must clear the credential state")
+	}
+	// Same for a listing success: the upstream authenticated the key.
+	pool.MarkFailure(node, credResponse(http.StatusUnauthorized, ""), nil)
+	pool.MarkListingSuccess(node)
+	if node.credUntil.Load() != 0 {
+		t.Fatal("MarkListingSuccess must clear the credential state")
+	}
+}
+
+// AllCredentialQuarantined mirrors AllQuotaCooled: partial pools are not a
+// wall, an empty pool never is, and the earliest reopening wins.
+func TestAllCredentialQuarantined(t *testing.T) {
+	pool := testKeyPool(0, 0)
+	if _, ok := pool.AllCredentialQuarantined(); ok {
+		t.Fatal("an empty pool must not report a credential wall")
+	}
+	pool = testKeyPool(3, 0)
+	if _, ok := pool.AllCredentialQuarantined(); ok {
+		t.Fatal("a pool without quarantines must not report a wall")
+	}
+	now := time.Now()
+	pool.nodes[0].credUntil.Store(now.Add(time.Hour).UnixNano())
+	if _, ok := pool.AllCredentialQuarantined(); ok {
+		t.Fatal("one quarantined key of three is not a wall")
+	}
+	pool.nodes[1].credUntil.Store(now.Add(2 * time.Hour).UnixNano())
+	pool.nodes[2].credUntil.Store(now.Add(30 * time.Minute).UnixNano())
+	earliest, ok := pool.AllCredentialQuarantined()
+	if !ok {
+		t.Fatal("all keys quarantined must report a wall")
+	}
+	if want := now.Add(30 * time.Minute); earliest.Sub(want) > time.Minute || want.Sub(earliest) > time.Minute {
+		t.Fatalf("earliest = %v, want about %v", earliest, want)
+	}
+}
+
+// A quarantined key is skipped by the cursor while a healthy key stays
+// reachable: the selection must not burn attempts on a dead credential.
+func TestCredentialQuarantinedSkippedByNext(t *testing.T) {
+	pool := testKeyPool(3, 0)
+	pool.credentialQuarantine = time.Hour
+	quarantined := pool.nodes[1]
+	pool.MarkFailure(quarantined, credResponse(http.StatusForbidden, ""), nil)
+	now := time.Now().UnixNano()
+	if usable := pool.HasUsableNode(); !usable {
+		t.Fatal("two healthy keys must keep the pool usable")
+	}
+	if quarantined.cooldownUntil.Load() < now {
+		t.Fatal("the quarantined key must be held out of rotation")
+	}
+	// The cursor walks past the quarantined key to a healthy one.
+	cursor := pool.Cursor()
+	pick := cursor.Next()
+	if pick == quarantined {
+		t.Fatal("the cursor must not select the quarantined key while healthy keys exist")
+	}
+	// All keys quarantined: the cursor still returns the earliest cooling key
+	// (callers bound attempts), and the pool reports a credential wall.
+	pool.nodes[0].credUntil.Store(now + int64(time.Hour))
+	pool.nodes[2].credUntil.Store(now + int64(time.Hour))
+	for _, node := range pool.nodes {
+		node.probeNextAt.Store(now) // probe due immediately
+	}
+	if _, walled := pool.AllCredentialQuarantined(); !walled {
+		t.Fatal("all keys quarantined must report a wall")
+	}
+	// ProbeDueNodes must surface the quarantined keys for probe recovery.
+	due := pool.ProbeDueNodes()
+	if len(due) != 3 {
+		t.Fatalf("ProbeDueNodes = %d nodes, want all 3 quarantined keys", len(due))
+	}
+}
+
+// The GEO classifier matches the region wordings on 4xx only.
 func TestMarkSuccessClearsQuota(t *testing.T) {
 	pool := testKeyPool(1, 10*time.Minute)
 	node := pool.nodes[0]

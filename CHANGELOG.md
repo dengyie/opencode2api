@@ -4,6 +4,52 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.7.0 (2026-11-14) — key credential quarantine: 401/403 handled inside the pool
+
+The 2026-11-14 production incident: a zen key had been rejected by the
+upstream with `401 Invalid credential` since 11-09, but the gateway only
+applied the short exponential cooldown (≤120s), so the dead key re-entered
+rotation every two minutes, kept getting 401'd, and — when it was the last
+key standing — the upstream 401 reached the fronting gateway (New-API),
+which auto-bans a channel on a forwarded 401. The channel went dark while
+five healthy keys existed one rotation away.
+
+The 429 quota wall already has a complete closed loop (quotaUntil +
+probe recovery + all-cooled pre-check); v1.7.0 gives credential rejections
+the same semantics.
+
+### Added
+
+- `performance.credential_quarantine_seconds` (default **86400**, range
+  0–2592000): how long a key stays out of rotation after the upstream
+  rejects *the key itself* with a 401/403. `0` restores the legacy
+  plain-cooldown behavior.
+- Credential pre-check: when every key of a tier is quarantined, requests
+  are answered with a synthesized `503` + `Retry-After` (earliest quarantine
+  expiry) and code `key_pool_credential_exhausted` with **zero upstream
+  calls** — the upstream 401 never reaches a caller.
+- Probe recovery: quarantined keys are re-tested by the quota probe loop
+  (`ProbeDueNodes` now covers both the 429 and the 401/403 classes); a
+  probe that reaches 200 clears the quarantine immediately.
+- healthz `keys.credential_quarantined` count (informational; a
+  quarantined key does not affect readiness).
+- Events: `key_credential_cooled` (live 401/403, both lanes incl. WARP),
+  `quota_probe_still_credential_dead` (probe against a still-dead key),
+  `credential_precheck_blocked` (zero-attempt rejection).
+
+### Changed
+
+- `MarkFailure` quarantines on 401/403 instead of the exponential cooldown:
+  `credUntil` pins `cooldownUntil` to the quarantine horizon (an upstream
+  `Retry-After` is meaningless for a dead key and is ignored), the failure
+  streak resets so the key returns clean, and `quotaUntil` is untouched —
+  the two failure classes stay independent.
+- `MarkSuccess` and `MarkListingSuccess` clear `credUntil` (a listing
+  proves the credential authenticates).
+- When the last upstream response on a key tier was a 401/403 (no other
+  key left to try), the request exits with a synthesized 503 instead of
+  forwarding the 401.
+
 ## v1.6.1 (2026-11-10) — event names that survive the log redactor
 
 Deploying v1.6.0 surfaced a logging trap: the TetherPool gateway's

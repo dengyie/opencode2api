@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -401,5 +403,201 @@ func TestE2EQuotaPrecheckAnonymousRoute(t *testing.T) {
 	}
 	if got := upstreamCalls.Load(); got != walkCalls {
 		t.Fatalf("the pre-checked request must not touch the upstream: calls %d -> %d", walkCalls, got)
+	}
+}
+
+// credentialFakeUpstream serves the discovery shapes and one inference
+// endpoint that answers 401 "Invalid credential" — the exact wording a dead
+// zen key produces — while counting every inference call. When healthy is
+// true the endpoint instead answers 200 with a complete stream, so a test can
+// flip the upstream and watch the probe recover the quarantined key.
+func credentialFakeUpstream(t *testing.T, healthy *atomic.Bool, calls *atomic.Int64) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"deepseek-v4.1-flash-free"}]}`))
+	})
+	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"opencode":{"id":"opencode","api":"https://opencode.ai/zen","npm":"@ai-sdk/openai-compatible","models":{"deepseek-v4.1-flash-free":{"id":"deepseek-v4.1-flash-free"}}}}`))
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if !healthy.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"Invalid credential","type":"authentication_error"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+		_ = r
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server
+}
+
+// postChat is chatStream for non-stream requests, returning status and body.
+func postChat(t *testing.T, handler http.Handler, model string) (int, string) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"`+model+`","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-api-key", "sk-local")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(raw)
+}
+
+// The v1.7.0 credential closed loop end-to-end: an upstream that 401s the key
+// (the my8Lw production shape) must NOT hand the 401 to the caller — New-API
+// auto-bans a channel on a forwarded 401. Instead the gateway quarantines the
+// key, synthesizes a 503 with a Retry-After, reports the quarantine in
+// healthz, pre-checks later requests with zero upstream calls, and the probe
+// loop revives the key once the upstream starts answering 200 again.
+func TestE2ECredentialQuarantineLoop(t *testing.T) {
+	var healthy atomic.Bool
+	var calls atomic.Int64
+	upstream := credentialFakeUpstream(t, &healthy, &calls)
+	g := gatewayFor(t, upstream.URL, `{"max_attempts": 3, "timeout_seconds": 30}`, `{"heartbeat_seconds": 0, "quota_probe_seconds": 1, "credential_quarantine_seconds": 7200}`)
+
+	// Walk: the only key gets 401'd across all attempts; the caller sees 503
+	// with the quarantine semantics, never the upstream 401.
+	status, body := postChat(t, g.Handler(), "deepseek-v4.1-flash-free")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (401 must not pass through), body: %q", status, body)
+	}
+	if strings.Contains(body, "Invalid credential") || status == http.StatusUnauthorized {
+		t.Fatalf("the upstream 401 leaked through: %q", body)
+	}
+	if !strings.Contains(body, "key_pool_credential_exhausted") {
+		t.Fatalf("error body must carry the credential-exhausted code: %q", body)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("the walk must reach the upstream")
+	}
+	node := g.zenNodes.nodes[0]
+	if node.credUntil.Load() == 0 {
+		t.Fatal("the 401 must quarantine the key")
+	}
+	retryAfter := respRetryAfter(t, g, "deepseek-v4.1-flash-free")
+	if retryAfter <= 0 {
+		t.Fatalf("Retry-After must name the quarantine horizon, got %d", retryAfter)
+	}
+
+	// healthz reports the quarantined key (informational, not a readiness block).
+	_, healthBody := getHealth(t, g)
+	keys, _ := healthBody["keys"].(map[string]any)
+	if got := keys["credential_quarantined"]; got != float64(1) {
+		t.Fatalf("credential_quarantined = %v, want 1", got)
+	}
+
+	// Pre-check: a second request while the wall holds answers with zero
+	// further upstream calls.
+	before := calls.Load()
+	status, body = postChat(t, g.Handler(), "deepseek-v4.1-flash-free")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("pre-checked status = %d, want 503, body: %q", status, body)
+	}
+	if got := calls.Load(); got != before {
+		t.Fatalf("the pre-checked request must not touch the upstream: calls %d -> %d", before, got)
+	}
+
+	// Probe recovery: the upstream starts answering 200; the probe loop clears
+	// the quarantine and the key routes live traffic again.
+	healthy.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	g.probeQuotaKey(ctx, g.zenNodes, node)
+	if node.credUntil.Load() != 0 || node.cooldownUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
+		t.Fatalf("a successful probe must clear the quarantine, got cooldown=%d cred=%d probeNext=%d",
+			node.cooldownUntil.Load(), node.credUntil.Load(), node.probeNextAt.Load())
+	}
+	status, body = postChat(t, g.Handler(), "deepseek-v4.1-flash-free")
+	if status != http.StatusOK || !strings.Contains(body, `"content":"OK"`) {
+		t.Fatalf("recovered key must route live traffic, got %d: %q", status, body)
+	}
+}
+
+// respRetryAfter issues a chat request and returns the parsed Retry-After.
+func respRetryAfter(t *testing.T, g *Gateway, model string) int {
+	t.Helper()
+	server := httptest.NewServer(g.Handler())
+	defer server.Close()
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"`+model+`","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", "sk-local")
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(ra)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// getHealth calls the healthz endpoint and returns the decoded document.
+func getHealth(t *testing.T, g *Gateway) (int, map[string]any) {
+	t.Helper()
+	server := httptest.NewServer(g.Handler())
+	defer server.Close()
+	resp, err := server.Client().Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("healthz body: %q", string(raw))
+	}
+	return resp.StatusCode, doc
+}
+
+// With credential_quarantine_seconds=0 the legacy behavior holds: no
+// credUntil marking, so the pre-check and the wall never engage, and the
+// last upstream 401 passes through exactly as before v1.7.0.
+func TestE2ECredentialQuarantineDisabled(t *testing.T) {
+	var healthy atomic.Bool
+	var calls atomic.Int64
+	upstream := credentialFakeUpstream(t, &healthy, &calls)
+	g := gatewayFor(t, upstream.URL, `{"max_attempts": 3, "timeout_seconds": 30}`, `{"heartbeat_seconds": 0, "quota_probe_seconds": 0, "credential_quarantine_seconds": 0}`)
+	status, _ := postChat(t, g.Handler(), "deepseek-v4.1-flash-free")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (legacy passthrough when quarantine is disabled)", status)
+	}
+	if node := g.zenNodes.nodes[0]; node.credUntil.Load() != 0 {
+		t.Fatal("disabled quarantine must not mark credUntil")
 	}
 }

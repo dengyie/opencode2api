@@ -612,6 +612,14 @@ type upstreamNode struct {
 	// again with one minimal real request.
 	quotaUntil  atomic.Int64
 	probeNextAt atomic.Int64
+	// credUntil (v1.7.0) records when this key's credential quarantine ends
+	// after a 401/403: the upstream rejected the key itself, not the request
+	// or the quota window, so the key leaves rotation for a long, configured
+	// stretch instead of the short failure cooldown. Like quotaUntil it is a
+	// superset of cooldownUntil (MarkFailure keeps them equal), but it reads
+	// through the probe loop and the credential pre-check as a distinct
+	// failure class: a quarantined key must not masquerade as quota-walled.
+	credUntil atomic.Int64
 	// rebindFiredAt (v1.6.0) is the last wall-triggered TetherPool battery
 	// report for this key, spacing reports rebind_min_interval_seconds apart.
 	rebindFiredAt atomic.Int64
@@ -631,6 +639,10 @@ type upstreamNodes struct {
 	// quota-cooled key (v1.5.0). Zero disables quota marking and probing for
 	// the pool, keeping the pre-v1.5 behavior.
 	quotaProbeInterval time.Duration
+	// credentialQuarantine (v1.7.0) is how long a key stays out of rotation
+	// after a 401/403. Zero keeps the pre-v1.7 behavior: the ordinary failure
+	// cooldown only, with the key back in rotation when it expires.
+	credentialQuarantine time.Duration
 }
 
 // nodePool distributes keys over proxies in round-robin order. When there
@@ -863,6 +875,7 @@ func (p *upstreamNodes) MarkSuccess(node *upstreamNode) {
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
 	node.quotaUntil.Store(0)
+	node.credUntil.Store(0)
 	node.probeNextAt.Store(0)
 }
 
@@ -870,10 +883,13 @@ func (p *upstreamNodes) MarkSuccess(node *upstreamNode) {
 // this key. That proves the key and its proxy transport work, not that the
 // quota window reopened — listings answer 200 even while inference is
 // quota-walled — so the quota state (v1.5.0) is deliberately left alone and
-// only a real inference success or a quota probe clears it.
+// only a real inference success or a quota probe clears it. A listing does
+// prove the credential itself works (the upstream authenticated the key), so
+// the credential quarantine (v1.7.0) is cleared here.
 func (p *upstreamNodes) MarkListingSuccess(node *upstreamNode) {
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	node.credUntil.Store(0)
 }
 
 // MarkFailure cools node down after an error or a 401, 403, 429 or 5xx
@@ -882,14 +898,31 @@ func (p *upstreamNodes) MarkListingSuccess(node *upstreamNode) {
 // Retry-After longer than that is honored in full. A 429 additionally marks
 // the key quota-cooled until the same instant, so the probe loop and the
 // quota pre-check can tell a spent quota window from an ordinary cooldown.
+// A 401/403 (v1.7.0) quarantines the key until the same instant as a longer,
+// configured credential quarantine: the upstream rejected the key itself, so
+// retrying it every cooldown expiry only burns requests and hands 401s to
+// callers. The probe loop re-tests quarantined keys like quota-cooled ones.
 func (p *upstreamNodes) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 		return
 	}
 	until := time.Now().Add(p.cooldownFor(node, resp, err))
 	node.cooldownUntil.Store(until.UnixNano())
-	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+	switch {
+	case resp != nil && resp.StatusCode == http.StatusTooManyRequests:
 		node.quotaUntil.Store(until.UnixNano())
+		if p.quotaProbeInterval > 0 {
+			node.probeNextAt.Store(time.Now().Add(p.quotaProbeInterval).UnixNano())
+		}
+	case resp != nil && p.credentialQuarantine > 0 && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden):
+		// A credential rejection ignores the short exponential cooldown and
+		// the upstream Retry-After (meaningless for a dead key): quarantine
+		// for the configured stretch, resetting the cooldown to the same
+		// instant so the selection logic skips the key for as long.
+		credUntil := time.Now().Add(p.credentialQuarantine)
+		node.credUntil.Store(credUntil.UnixNano())
+		node.cooldownUntil.Store(credUntil.UnixNano())
+		node.failures.Store(0) // the quarantine is not a streak; start clean on return
 		if p.quotaProbeInterval > 0 {
 			node.probeNextAt.Store(time.Now().Add(p.quotaProbeInterval).UnixNano())
 		}
@@ -941,6 +974,74 @@ func (p *upstreamNodes) QuotaCooledNodes() []*upstreamNode {
 		}
 	}
 	return cooled
+}
+
+// CredentialQuarantinedNodes returns the pool's keys that are currently
+// credential-quarantined (v1.7.0) — the upstream 401/403'd the key itself.
+func (p *upstreamNodes) CredentialQuarantinedNodes() []*upstreamNode {
+	if p == nil {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	var quarantined []*upstreamNode
+	for _, node := range p.nodes {
+		if node.credUntil.Load() > now {
+			quarantined = append(quarantined, node)
+		}
+	}
+	return quarantined
+}
+
+// AllCredentialQuarantined mirrors AllQuotaCooled for the credential class
+// (v1.7.0): whether every key of this pool is currently quarantined after a
+// 401/403 and when the first one reopens. The credential pre-check uses this
+// to reject a request with zero upstream calls instead of burning attempts
+// on keys the upstream has already rejected.
+func (p *upstreamNodes) AllCredentialQuarantined() (time.Time, bool) {
+	if p == nil || len(p.nodes) == 0 {
+		return time.Time{}, false
+	}
+	now := time.Now().UnixNano()
+	earliest := time.Time{}
+	for _, node := range p.nodes {
+		until := node.credUntil.Load()
+		if until <= now {
+			return time.Time{}, false
+		}
+		if earliest.IsZero() || until < earliest.UnixNano() {
+			earliest = time.Unix(0, until)
+		}
+	}
+	return earliest, true
+}
+
+// ProbeDueNodes returns the pool's keys whose probe is due: keys marked
+// unavailable in a way the probe loop can re-test — quota-cooled (429) or
+// credential-quarantined (401/403, v1.7.0) — and whose probeNextAt has
+// elapsed. A key in the ordinary failure cooldown is not probed: that
+// cooldown exists to absorb transport blips, and time alone resolves them.
+func (p *upstreamNodes) ProbeDueNodes() []*upstreamNode {
+	if p == nil {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	var due []*upstreamNode
+	for _, node := range p.nodes {
+		if node.probeNextAt.Load() == 0 {
+			continue
+		}
+		if node.quotaUntil.Load() <= now && node.credUntil.Load() <= now {
+			// Marked for probing but no longer walled or quarantined (the
+			// cooldown expired, or a listing success cleared the state):
+			// drop the stale probe mark so the zero value stays canonical.
+			node.probeNextAt.Store(0)
+			continue
+		}
+		if node.probeNextAt.Load() <= now {
+			due = append(due, node)
+		}
+	}
+	return due
 }
 
 // AllQuotaCooled reports whether every key of this pool is quota-cooled and

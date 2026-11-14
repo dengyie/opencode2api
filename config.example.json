@@ -37,7 +37,8 @@
     "first_event_timeout_seconds": 0,
     "max_anonymous_exits": 8,
     "free_tier_block_seconds": 900,
-    "wall_probe_timeout_seconds": 5
+    "wall_probe_timeout_seconds": 5,
+    "credential_quarantine_seconds": 86400
   },
   "tetherpool": {
     "enabled": false,

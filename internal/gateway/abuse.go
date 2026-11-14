@@ -149,6 +149,20 @@ var errGeoBlocked = errors.New("model not available in this egress region")
 // reads like an authentication problem to retry against.
 const geoBlockedMessage = "the upstream does not offer this model in the region this gateway egresses from; egressing through another region (a different proxy or WARP exit) may make it available"
 
+// errKeyCredentialsExhausted (v1.7.0) reports that the last upstream response
+// on a key tier was a 401/403 — the upstream rejected the key itself — and no
+// other key was left to try. The 401 must not reach the caller: fronting
+// gateways treat a 401 as a dead channel and disable it, while every other
+// key's rejection was already absorbed by the in-tier rotation. The handler
+// synthesizes a 503 with the earliest quarantine expiry instead.
+var errKeyCredentialsExhausted = errors.New("upstream keys failed credential validation")
+
+// keyPoolCredentialExhaustedMessage is what a client receives when every key
+// is credential-quarantined (v1.7.0). It names the cause and the recovery
+// path so the caller knows the 503 is transient — the probe loop re-tests
+// the keys — and not an invitation to re-send credentials it does not have.
+const keyPoolCredentialExhaustedMessage = "all configured upstream keys failed credential validation (401/403); the gateway quarantined them and keeps probing, so retry after the Retry-After interval or fix the upstream keys"
+
 // geoBlockMarkers are the region-availability wordings the upstream uses for
 // a model this egress may not call. Matched only on 4xx bodies; the wordings
 // are specific enough that a quota or shape rejection never trips them.
