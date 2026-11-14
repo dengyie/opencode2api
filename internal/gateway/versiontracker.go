@@ -191,12 +191,11 @@ func fetchLatestVersion(ctx context.Context, client *http.Client, url string) (s
 	if res.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("version feed returned %d", res.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-	if err != nil {
-		return "", err
-	}
+	// The 30-release feed runs ~1.6MB; the cap only guards a runaway
+	// response, so decode over a generous limit (16MB) instead of a tight
+	// one that truncates the list mid-record.
 	var entries []versionFeedEntry
-	if err := json.Unmarshal(body, &entries); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 16<<20)).Decode(&entries); err != nil {
 		return "", fmt.Errorf("decode version feed: %w", err)
 	}
 	for _, entry := range entries {
