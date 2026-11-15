@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,11 +74,23 @@ type versionTracker struct {
 
 // newVersionTracker seeds the state from the config. ceiling empty means the
 // compile-time version, so out of the box auto-sync can never claim a release
-// the operator has not verified.
+// the operator has not verified. The per-key fingerprint pool is seeded here
+// too: compile-time capture plus the known real releases, pruned to the
+// ceiling, so every key claims a release upstream actually shipped and none
+// claims ahead of the verified global.
 func newVersionTracker(ceiling string, autoSync bool) *versionTracker {
 	if ceiling == "" {
 		ceiling = httpx.V2ClientVersion()
 	}
+	pool := append([]string{httpx.V2ClientVersion()}, httpx.FingerprintPoolSeed()...)
+	kept := pool[:0]
+	for _, version := range pool {
+		// versionNewer(a, b) reports a > b; drop anything above the ceiling.
+		if !versionNewer(version, ceiling) && !slices.Contains(kept, version) {
+			kept = append(kept, version)
+		}
+	}
+	httpx.SetV2FingerprintPool(kept)
 	return &versionTracker{
 		state: versionState{
 			Latest:   httpx.V2ClientVersion(),
@@ -164,6 +177,11 @@ func (g *Gateway) applyVersionState(latest string, checked time.Time, source str
 		g.logger.Info("newer client release detected", "component", "models", "event", "version_update_detected", "latest", latest, "active", tracker.state.Active, "ceiling", tracker.ceiling)
 	default:
 		httpx.SetV2ClientVersion(latest)
+		// Widen the per-key fingerprint pool with the verified release so
+		// keys distribute across every real claim the gateway knows; the
+		// ceiling stays the guard, so nothing above it ever enters here.
+		pool := append(httpx.V2FingerprintPool(), latest)
+		httpx.SetV2FingerprintPool(pool)
 		tracker.state.Active = latest
 		tracker.state.Synced = true
 		g.logger.Info("client masquerade version updated", "component", "models", "event", "version_synced", "from", previous, "to", latest, "ceiling", tracker.ceiling)

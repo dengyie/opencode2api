@@ -623,6 +623,11 @@ type upstreamNode struct {
 	// rebindFiredAt (v1.6.0) is the last wall-triggered TetherPool battery
 	// report for this key, spacing reports rebind_min_interval_seconds apart.
 	rebindFiredAt atomic.Int64
+	// uaVersion (v1.7.4) is the v2 client release this key claims in its
+	// User-Agent, drawn from the fingerprint pool by the key's fingerprint.
+	// Empty means the global claimed version: the anonymous lane and callers
+	// without a key-bound fingerprint share one identity by design.
+	uaVersion string
 }
 
 // upstreamNodes is one tier's key pool. bindingsMu serializes rebinding and
@@ -664,7 +669,14 @@ func nodePool(keys []string, transports *proxyTransports, cooldown time.Duration
 	}
 	for i, key := range keys {
 		proxyIndex := i % len(transports.items)
-		node := &upstreamNode{key: key, index: i, preferredProxy: proxyIndex}
+		// Each key claims its own v2 release from the fingerprint pool so
+		// keys on distinct exits also carry distinct client identities (v1.7.4).
+		node := &upstreamNode{
+			key:            key,
+			index:          i,
+			preferredProxy: proxyIndex,
+			uaVersion:      httpx.V2VersionForKey(config.Fingerprint(key)),
+		}
 		node.proxyIndex.Store(int64(proxyIndex))
 		pool.nodes = append(pool.nodes, node)
 		pool.bindingCount[proxyIndex]++
