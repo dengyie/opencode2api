@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/httpx"
 	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	"opencode2api/internal/models"
@@ -242,7 +243,7 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	ids.Request = identity.RandomID("req", 16)
-	req, err := upstreamRequest(ctx, baseURL, protocol, b, ids, key)
+	req, err := upstreamRequest(ctx, baseURL, protocol, b, ids, key, httpx.V2VersionForKey(config.Fingerprint(key)))
 	if err != nil {
 		return probeResult{reason: "request_creation_error"}
 	}

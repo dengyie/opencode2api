@@ -86,10 +86,11 @@ func fetchQuota(ctx context.Context, endpoint, key string) (map[string]quotaWind
 		return nil, errors.New("额度查询地址无效")
 	}
 	// The Go lane is a v2 lane: report the v2 CLI identity and a canonical
-	// session pinned to the key instead of anything naming the gateway.
+	// session pinned to the key instead of anything naming the gateway. The
+	// UA claims the key's own fingerprint-pool release (v1.7.4).
 	session := identity.CanonicalSessionID("quota\x00" + config.Fingerprint(key))
 	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("User-Agent", httpx.V2UserAgent())
+	req.Header.Set("User-Agent", httpx.V2UserAgentForVersion(httpx.V2VersionForKey(config.Fingerprint(key))))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", session)

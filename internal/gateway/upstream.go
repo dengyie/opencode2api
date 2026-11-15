@@ -490,7 +490,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, prepared, ids, anonymousZenKey)
+			req, err := upstreamRequest(ctx, baseURL, protocol, prepared, ids, anonymousZenKey, "")
 			if err != nil {
 				return nil, err, attempts
 			}
@@ -908,7 +908,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	} else {
 		setRequestCredential(ctx, override.Tier, keyID, "key", false, proxy)
 	}
-	req, err := upstreamRequest(ctx, baseURL, route.ProtocolFor(override.Tier), body, ids, node.key)
+	req, err := upstreamRequest(ctx, baseURL, route.ProtocolFor(override.Tier), body, ids, node.key, node.uaVersion)
 	if err != nil {
 		return nil, err, 0
 	}
@@ -1010,7 +1010,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := upstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
+		req, err := upstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key, node.uaVersion)
 		if err != nil {
 			return nil, err, attempts
 		}
@@ -1277,7 +1277,13 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 // keeps its shape. key is sent as x-api-key (with anthropic-version) on the
 // Anthropic protocol and as a Bearer token on every other one; the anonymous
 // lane passes anonymousZenKey.
-func upstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol, body []byte, ids identity.RequestIDs, key string) (*http.Request, error) {
+// upstreamRequest builds one upstream inference request. key is the credential
+// of the attempt's node — a real zen/go key, or the literal anonymous token —
+// and uaVersion is the v2 release that node claims in its User-Agent (empty
+// keeps the global claimed version, the anonymous lane's shared identity).
+// The key itself is sent as an x-api-key on the Anthropic protocol and as a
+// Bearer token on every other one; the anonymous lane passes anonymousZenKey.
+func upstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol, body []byte, ids identity.RequestIDs, key, uaVersion string) (*http.Request, error) {
 	endpoint := strings.TrimRight(baseURL, "/") + wire.Path(protocol)
 	if !models.IsV1Upstream(baseURL) {
 		endpoint = strings.TrimRight(baseURL, "/") + v2EndpointPath(baseURL, protocol)
@@ -1293,7 +1299,7 @@ func upstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol
 	if models.IsV1Upstream(baseURL) {
 		setV1Headers(req.Header, protocol, body, ids)
 	} else {
-		setV2Headers(req.Header, protocol, ids)
+		setV2Headers(req.Header, protocol, ids, uaVersion)
 	}
 	if protocol == wire.Anthropic {
 		req.Header.Set("x-api-key", key)
@@ -1381,8 +1387,10 @@ func setV1Headers(header http.Header, protocol wire.Protocol, body []byte, ids i
 // x-opencode-project. The v2 gate rejects x-opencode-request and canonical
 // prj_* project ids with 403 FreeTierError, so neither is sent. Anthropic
 // requests carry a fixed anthropic-beta set; upstreamRequest adds
-// anthropic-version and the beta query.
-func setV2Headers(header http.Header, protocol wire.Protocol, ids identity.RequestIDs) {
+// anthropic-version and the beta query. uaVersion is the v2 release the
+// attempt's key claims (v1.7.4 per-key fingerprint isolation); empty renders
+// the global claimed version.
+func setV2Headers(header http.Header, protocol wire.Protocol, ids identity.RequestIDs, uaVersion string) {
 	header.Set("x-opencode-client", "cli")
 	rootSession := ids.Session
 	if ids.ParentSession != "" {
@@ -1399,7 +1407,7 @@ func setV2Headers(header http.Header, protocol wire.Protocol, ids identity.Reque
 	header.Set("X-Session-Id", rootSession)
 	header.Set("x-opencode-session", rootSession)
 	header.Set("x-opencode-session-id", childSession)
-	header.Set("User-Agent", httpx.V2UserAgent())
+	header.Set("User-Agent", httpx.V2UserAgentForVersion(uaVersion))
 	header.Set("x-opencode-project", projectID(ids.Project))
 	if protocol == wire.Anthropic {
 		header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")

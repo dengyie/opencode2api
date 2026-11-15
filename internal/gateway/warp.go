@@ -296,7 +296,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, prepared, ids, anonymousZenKey)
+			req, err := upstreamRequest(ctx, baseURL, protocol, prepared, ids, anonymousZenKey, "")
 			if err != nil {
 				return nil, err, attempts
 			}

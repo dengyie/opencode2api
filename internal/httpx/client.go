@@ -1,6 +1,9 @@
 package httpx
 
-import "sync/atomic"
+import (
+	"hash/fnv"
+	"sync/atomic"
+)
 
 // v2ClientVersion is the OpenCode 2.x CLI release the gateway claims to be on
 // the v2 lanes (/inference and /zen/go). The version number itself is not
@@ -56,10 +59,83 @@ func V2ClientVersion() string {
 // constant.
 func SetV2ClientVersion(version string) { v2ClientVersion.Store(version) }
 
+// v2FingerprintPool holds the v2 releases per-key User-Agents are drawn from.
+// Every entry is a release the official client actually shipped (the compile
+// version plus everything the version tracker has applied), so a per-key
+// claim never invents a fingerprint upstream never saw. nil means every key
+// shares the global claimed version.
+var v2FingerprintPool atomic.Value
+
+// fingerprintPoolSeed lists the real releases the initial pool is seeded
+// with: the compile-time capture plus the two stable releases published
+// since. Only versions at or below the tracker's ceiling survive (seeded in
+// newVersionTracker), so the pool never claims ahead of the verified global.
+var fingerprintPoolSeed = []string{"2.2.7", "2.3.0"}
+
+// FingerprintPoolSeed returns the seed versions the per-key pool starts
+// from. The caller (the version tracker) combines them with the compile-time
+// version and prunes to its ceiling.
+func FingerprintPoolSeed() []string {
+	return append([]string(nil), fingerprintPoolSeed...)
+}
+
+// V2FingerprintPool returns the per-key version pool, empty when unset.
+func V2FingerprintPool() []string {
+	if v := v2FingerprintPool.Load(); v != nil {
+		return v.([]string)
+	}
+	return nil
+}
+
+// SetV2FingerprintPool replaces the per-key version pool. Duplicate versions
+// are dropped; an empty list clears the pool, collapsing every key back to
+// the global claimed version.
+func SetV2FingerprintPool(versions []string) {
+	if len(versions) == 0 {
+		v2FingerprintPool.Store([]string(nil))
+		return
+	}
+	seen := make(map[string]bool, len(versions))
+	deduped := make([]string, 0, len(versions))
+	for _, version := range versions {
+		if version == "" || seen[version] {
+			continue
+		}
+		seen[version] = true
+		deduped = append(deduped, version)
+	}
+	v2FingerprintPool.Store(deduped)
+}
+
+// V2VersionForKey deterministically picks the v2 release a key claims from
+// the fingerprint pool. Same fingerprint, same version for the life of the
+// process (and across restarts, since the pool seeds from constants before
+// the tracker widens it deterministically); an empty or single-version pool
+// collapses to the global claimed version, as does an unknown key fingerprint.
+func V2VersionForKey(keyFingerprint string) string {
+	pool := V2FingerprintPool()
+	if len(pool) <= 1 {
+		return V2ClientVersion()
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(keyFingerprint))
+	return pool[hash.Sum64()%uint64(len(pool))]
+}
+
 // V2UserAgent reports the gateway as an OpenCode 2.x CLI using the shape the
 // v2 gate expects: "opencode/<channel>/<version>/<name>".
 func V2UserAgent() string {
-	return "opencode/latest/" + V2ClientVersion() + "/cli"
+	return V2UserAgentForVersion(V2ClientVersion())
+}
+
+// V2UserAgentForVersion renders the v2 User-Agent for a specific claimed
+// release. An empty version falls back to the global claim, the shared shape
+// for the anonymous lane and any caller without a key-bound fingerprint.
+func V2UserAgentForVersion(version string) string {
+	if version == "" {
+		version = V2ClientVersion()
+	}
+	return "opencode/latest/" + version + "/cli"
 }
 
 // V1UserAgent is the OpenCode 1.x client's own User-Agent, a bare

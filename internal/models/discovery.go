@@ -326,7 +326,10 @@ func FetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 	if IsV1Upstream(trimmed) {
 		req.Header.Set("User-Agent", httpx.V1UserAgent())
 	} else {
-		req.Header.Set("User-Agent", httpx.V2UserAgent())
+		// Per-key fingerprint isolation (v1.7.4): the key claims the v2
+		// release the fingerprint pool assigned it, matching the inference
+		// path; the anonymous token falls back to the global claim.
+		req.Header.Set("User-Agent", httpx.V2UserAgentForVersion(httpx.V2VersionForKey(config.Fingerprint(key))))
 	}
 	req.Header.Set("x-opencode-client", "cli")
 	resp, err := client.Do(req)
