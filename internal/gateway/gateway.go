@@ -137,6 +137,9 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	if err != nil {
 		return nil, err
 	}
+	// v1.7.5: seed the per-key fingerprint pool before the node pools — the
+	// nodes materialize their claimed release from it once, at build time.
+	seedFingerprintPool(cfg.Performance.VersionSync.Ceiling)
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
 	zenNodes, err := nodePool(cfg.ZenKeys, transports, cooldown)
 	if err != nil {
