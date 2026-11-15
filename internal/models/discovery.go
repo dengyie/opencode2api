@@ -313,10 +313,12 @@ type modelsResponse struct {
 }
 
 // FetchModels lists the model IDs at baseURL's /v1/models with key, sending
-// the v1 or v2 User-Agent that matches the lane. It also returns the HTTP
-// status, 0 when no response arrived, so callers can judge the proxy. An empty
-// list is an error.
-func FetchModels(ctx context.Context, client *http.Client, baseURL, key string) ([]string, int, error) {
+// the v1 or v2 User-Agent that matches the lane. uaVersion is the v2 release
+// the key claims in its User-Agent: the node's own claim for a keyed lane,
+// empty (the global claimed version) for the anonymous token, matching the
+// inference path. It also returns the HTTP status, 0 when no response
+// arrived, so callers can judge the proxy. An empty list is an error.
+func FetchModels(ctx context.Context, client *http.Client, baseURL, key, uaVersion string) ([]string, int, error) {
 	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimmed+"/v1/models", nil)
 	if err != nil {
@@ -326,10 +328,7 @@ func FetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 	if IsV1Upstream(trimmed) {
 		req.Header.Set("User-Agent", httpx.V1UserAgent())
 	} else {
-		// Per-key fingerprint isolation (v1.7.4): the key claims the v2
-		// release the fingerprint pool assigned it, matching the inference
-		// path; the anonymous token falls back to the global claim.
-		req.Header.Set("User-Agent", httpx.V2UserAgentForVersion(httpx.V2VersionForKey(config.Fingerprint(key))))
+		req.Header.Set("User-Agent", httpx.V2UserAgentForVersion(uaVersion))
 	}
 	req.Header.Set("x-opencode-client", "cli")
 	resp, err := client.Do(req)

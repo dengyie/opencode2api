@@ -72,13 +72,14 @@ type versionTracker struct {
 	client   *http.Client
 }
 
-// newVersionTracker seeds the state from the config. ceiling empty means the
-// compile-time version, so out of the box auto-sync can never claim a release
-// the operator has not verified. The per-key fingerprint pool is seeded here
-// too: compile-time capture plus the known real releases, pruned to the
-// ceiling, so every key claims a release upstream actually shipped and none
-// claims ahead of the verified global.
-func newVersionTracker(ceiling string, autoSync bool) *versionTracker {
+// seedFingerprintPool seeds the per-key UA pool: the current global claim
+// plus the known real releases, pruned to the ceiling, so every key claims a
+// release upstream actually shipped and none claims ahead of the verified
+// global. ceiling empty means the compile-time version. It must run before
+// any nodePool construction — the nodes materialize their claimed release
+// from this pool once, at build time (v1.7.4); a config rebuild intentionally
+// reseeds the baseline and rederives every key's assignment.
+func seedFingerprintPool(ceiling string) {
 	if ceiling == "" {
 		ceiling = httpx.V2ClientVersion()
 	}
@@ -91,6 +92,16 @@ func newVersionTracker(ceiling string, autoSync bool) *versionTracker {
 		}
 	}
 	httpx.SetV2FingerprintPool(kept)
+}
+
+// newVersionTracker seeds the tracker state from the config. It does not
+// touch the fingerprint pool: gateway.New calls seedFingerprintPool before
+// building the node pools, and calling it here would run too late for the
+// nodes built earlier in New (v1.7.5 regression fix).
+func newVersionTracker(ceiling string, autoSync bool) *versionTracker {
+	if ceiling == "" {
+		ceiling = httpx.V2ClientVersion()
+	}
 	return &versionTracker{
 		state: versionState{
 			Latest:   httpx.V2ClientVersion(),

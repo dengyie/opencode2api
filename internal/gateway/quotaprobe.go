@@ -132,7 +132,7 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 	tier := tierOf(nodes, g)
 	overWARP := g.usesWARP(model, tier, false)
 	started := time.Now()
-	result := g.probeAttempt(ctx, g.inferenceClient(proxy, baseURL, model), baseURL, node.key, model, protocol, ids, "", overWARP)
+	result := g.probeAttempt(ctx, g.inferenceClient(proxy, baseURL, model), baseURL, node.key, model, protocol, ids, "", overWARP, node.uaVersion)
 	if !result.attempted {
 		// No request reached the upstream (transport/proxy down): probe again
 		// next interval without changing any cooldown state.

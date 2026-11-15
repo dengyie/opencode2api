@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -64,28 +66,28 @@ func TestV2VersionForKeyFallsBackToGlobal(t *testing.T) {
 	}
 }
 
-// The tracker seeds the pool from the compile version plus the real-release
-// seed, pruned to the ceiling, so no key ever claims above the verified
-// ceiling. An empty ceiling maps to the compile version: out of the box the
-// pool holds only the verified compile claim.
+// The pool seeding (split out of newVersionTracker in v1.7.5 so gateway.New
+// can run it before the node pools) prunes to the ceiling: no key ever claims
+// above the verified ceiling. An empty ceiling maps to the compile version:
+// out of the box the pool holds only the verified compile claim.
 func TestVersionTrackerSeedsFingerprintPoolUnderCeiling(t *testing.T) {
 	setTestV2Version(t, "2.1.1")
 
-	testVersionGateway(t, "2.2.7", false)
+	seedFingerprintPool("2.2.7")
 	pool := httpx.V2FingerprintPool()
 	want := []string{"2.1.1", "2.2.7"}
 	if !slices.Equal(pool, want) {
 		t.Fatalf("pool under ceiling 2.2.7 = %v; want %v (2.3.0 pruned)", pool, want)
 	}
 
-	testVersionGateway(t, "2.3.0", false)
+	seedFingerprintPool("2.3.0")
 	pool = httpx.V2FingerprintPool()
 	want = []string{"2.1.1", "2.2.7", "2.3.0"}
 	if !slices.Equal(pool, want) {
 		t.Fatalf("pool under ceiling 2.3.0 = %v; want %v", pool, want)
 	}
 
-	testVersionGateway(t, "", false)
+	seedFingerprintPool("")
 	pool = httpx.V2FingerprintPool()
 	want = []string{"2.1.1"}
 	if !slices.Equal(pool, want) {
@@ -167,7 +169,9 @@ func TestNodePoolDerivesPerKeyUAVersions(t *testing.T) {
 	setTestV2Version(t, "2.1.1")
 	setTestFingerprintPool(t, []string{"2.1.1", "2.2.7", "2.3.0"})
 	transports, err := transportPool([]string{"direct", "direct"}, config.PerformanceConfig{}, 0)
-
+	if err != nil {
+		t.Fatal(err)
+	}
 	keys := []string{"oc_sk_test_aaaa1111", "oc_sk_test_bbbb2222", "oc_sk_test_cccc3333"}
 	pool, err := nodePool(keys, transports, time.Second)
 	if err != nil {
@@ -192,6 +196,77 @@ func TestNodePoolDerivesPerKeyUAVersions(t *testing.T) {
 		if rebuilt.nodes[i].uaVersion != pool.nodes[i].uaVersion {
 			t.Fatalf("rebuild changed node %d from %q to %q; versions must be stable",
 				i, pool.nodes[i].uaVersion, rebuilt.nodes[i].uaVersion)
+		}
+	}
+}
+
+// gateway.New must seed the fingerprint pool before it builds the node pools:
+// the nodes materialize their claimed release from the pool once, at build
+// time. This pins the v1.7.5 ordering fix — a cold start with a multi-version
+// pool must yield per-key claims, not the global compile version frozen into
+// every node.
+func TestNewSeedsFingerprintPoolBeforeNodePools(t *testing.T) {
+	setTestV2Version(t, "2.1.1")
+	doc := `{
+		"listen": "127.0.0.1:0",
+		"server_keys": ["sk-local"],
+		"zen_keys": ["oc_sk_test_aaaa1111", "oc_sk_test_bbbb2222", "oc_sk_test_cccc3333"],
+		"anonymous": false,
+		"proxies": ["direct"],
+		"upstream": {"zen": "https://zen.example.com", "go": "https://go.example.com"},
+		"performance": {"version_sync": {"ceiling": "2.3.0"}}
+	}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	g, err := New(cfg, quietLogger(), nil, nil)
+	if err != nil {
+		t.Fatalf("gateway: %v", err)
+	}
+	pool := httpx.V2FingerprintPool()
+	want := []string{"2.1.1", "2.2.7", "2.3.0"}
+	if !slices.Equal(pool, want) {
+		t.Fatalf("cold-start pool = %v; want %v", pool, want)
+	}
+	keys := cfg.ZenKeys
+	if len(keys) != 3 {
+		t.Fatalf("expected 3 zen keys, got %d", len(keys))
+	}
+	seen := map[string]bool{}
+	for i, node := range g.zenNodes.nodes {
+		wantVersion := httpx.V2VersionForKey(config.Fingerprint(keys[i]))
+		if node.uaVersion != wantVersion {
+			t.Fatalf("cold-start node %d uaVersion = %q; want the pool assignment %q", i, node.uaVersion, wantVersion)
+		}
+		seen[node.uaVersion] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("cold start collapsed all nodes to %v; per-key isolation did not engage", seen)
+	}
+}
+
+// The anonymous lane must render one identity everywhere. The pool cannot
+// special-case the anonymous token — consistency is the callers' contract:
+// anonymous inference, probes and model listings pass uaVersion="" (the
+// global claimed version), keyed lanes pass the node's own claim. The pool
+// seeded for this test holds only entries other than the compile claim, so
+// any caller that derived a claim from the anonymous token would render a
+// UA that differs from what anonymous inference sends; the anonymous render
+// here must stay on the global version (v1.7.5).
+func TestAnonymousLaneSharesGlobalClaim(t *testing.T) {
+	setTestV2Version(t, "2.1.1")
+	setTestFingerprintPool(t, []string{"2.2.7", "2.3.0"})
+	if got := httpx.V2UserAgentForVersion(""); got != "opencode/latest/2.1.1/cli" {
+		t.Fatalf("anonymous UA = %q; want the global claim opencode/latest/2.1.1/cli", got)
+	}
+	for _, version := range httpx.V2FingerprintPool() {
+		if got := httpx.V2UserAgentForVersion(version); got == httpx.V2UserAgentForVersion("") {
+			t.Fatalf("pool version %q renders the anonymous lane's UA; a leaked per-key claim would be invisible", version)
 		}
 	}
 }

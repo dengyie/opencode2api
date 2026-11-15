@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
-	"opencode2api/internal/httpx"
 	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	"opencode2api/internal/models"
@@ -122,8 +121,13 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	ids := probeRequestIDs()
 	type lane struct {
 		key, name, baseURL string
-		client             *http.Client
-		warp               bool
+		// uaVersion is the v2 release this lane claims in its User-Agent: the
+		// node's own claim for a keyed lane, empty (the global claimed
+		// version) for the anonymous lane — matching the inference path, so a
+		// probe validates the identity live traffic actually uses (v1.7.5).
+		uaVersion string
+		client    *http.Client
+		warp      bool
 	}
 	var lanes []lane
 	anonymousPaused := false
@@ -157,9 +161,9 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	cursor := g.zenNodes.CursorFor(ids.Session)
 	if node := cursor.Next(); node != nil {
 		if g.usesWARP(model, config.TierZen, false) {
-			lanes = append(lanes, lane{key: node.key, name: "zen", baseURL: g.cfg.Upstream.Zen, warp: true})
+			lanes = append(lanes, lane{key: node.key, name: "zen", baseURL: g.cfg.Upstream.Zen, uaVersion: node.uaVersion, warp: true})
 		} else if proxy := g.zenNodes.Proxy(node); proxy != nil {
-			lanes = append(lanes, lane{key: node.key, name: "zen", baseURL: g.cfg.Upstream.Zen, client: g.inferenceClient(proxy, g.cfg.Upstream.Zen, model)})
+			lanes = append(lanes, lane{key: node.key, name: "zen", baseURL: g.cfg.Upstream.Zen, uaVersion: node.uaVersion, client: g.inferenceClient(proxy, g.cfg.Upstream.Zen, model)})
 		}
 	}
 	result := probeResult{reason: "no_probe_channel"}
@@ -172,7 +176,7 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 			return probeResult{reason: "canceled"}
 		}
 		run := func(effort string) probeResult {
-			return g.probeAttempt(ctx, lane.client, lane.baseURL, lane.key, model, protocol, ids, effort, lane.warp)
+			return g.probeAttempt(ctx, lane.client, lane.baseURL, lane.key, model, protocol, ids, effort, lane.warp, lane.uaVersion)
 		}
 		result = run("")
 		result.channel = lane.name
@@ -231,11 +235,14 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 // doInferenceAttempt and records nothing against keys or proxies. When overWARP
 // is set the probe leaves through an acquired WARP exit instead of client, and
 // the pool sees the outcome (Report on a response, Fail on a transport error).
+// uaVersion is the v2 release the attempt claims in its User-Agent: the lane
+// node's own claim for a keyed lane, empty (the global claimed version) for
+// the anonymous lane, so a probe validates the identity live traffic uses.
 // Success requires a 2xx whose SSE stream collapses cleanly or whose JSON
 // document has the protocol's result field; a failure carries a reason code
 // (http_<status>, model_unavailable, probe_timeout, warp_unavailable, ...) and
 // whether the upstream rejected the reasoning effort.
-func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, baseURL, key, model string, protocol wire.Protocol, ids identity.RequestIDs, effort string, overWARP bool) probeResult {
+func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, baseURL, key, model string, protocol wire.Protocol, ids identity.RequestIDs, effort string, overWARP bool, uaVersion string) probeResult {
 	b, err := probePayload(model, protocol, effort, models.IsV1Upstream(baseURL))
 	if err != nil {
 		return probeResult{reason: "request_conversion_error"}
@@ -243,7 +250,7 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	ids.Request = identity.RandomID("req", 16)
-	req, err := upstreamRequest(ctx, baseURL, protocol, b, ids, key, httpx.V2VersionForKey(config.Fingerprint(key)))
+	req, err := upstreamRequest(ctx, baseURL, protocol, b, ids, key, uaVersion)
 	if err != nil {
 		return probeResult{reason: "request_creation_error"}
 	}
