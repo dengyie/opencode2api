@@ -367,3 +367,37 @@ func (b *lockedBuffer) String() string {
 func containsBind(entry, account string) bool {
 	return strings.Contains(entry, account+"__type_warp_ipv6")
 }
+
+// Removing a key shifts every later key's positional region, changing cache
+// keys without changing keys (v1.8.0). The resolve must reuse each surviving
+// key's existing binding across regions instead of re-acquiring a new exit.
+func TestResolveReusesBindingsAcrossRegionShift(t *testing.T) {
+	cp := &recordingCP{}
+	server := httptest.NewServer(cp.handler())
+	defer server.Close()
+
+	p := NewProvisioner()
+	full := testConfig(t, server.URL) // keys 11111, 22222, 33333
+	if _, _, err := p.Resolve(context.Background(), full, nil); err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	first := cp.count()
+
+	// Evict the first key: the survivors shift positions, so 22222 moves from
+	// region index 1 (tokyo) to 0 (singapore) and 33333 from 0 to 1.
+	trimmed := full
+	trimmed.ZenKeys = []string{"oc_sk_bbb_22222", "oc_sk_ccc_33333"}
+	entries, snapshot, err := p.Resolve(context.Background(), trimmed, nil)
+	if err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if got := cp.count(); got != first {
+		t.Fatalf("surviving keys must be served from the cross-region cache with zero new acquires, acquires went %d → %d", first, got)
+	}
+	if len(entries) != 3 || snapshot.Mode != "cache" {
+		t.Fatalf("expected 2 cached bindings + 1 spare in mode cache, got %q / %s", entries, snapshot.Mode)
+	}
+	if !containsBind(entries[0], "oc2api_22222") || !containsBind(entries[1], "oc2api_33333") {
+		t.Fatalf("surviving keys must keep their own bindings, got %q", entries)
+	}
+}

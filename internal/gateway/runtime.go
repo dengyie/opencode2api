@@ -268,6 +268,39 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 	}
 	gateway.rotation = m.rotation
 	gateway.tpRebind = m.tpRebind
+	// v1.8.0: the eviction callback removes a credential-dead key from the
+	// config through the standard read-modify-write apply (persisted via
+	// SaveAtomic, runtime rebuilt, TetherPool re-provisioned). Removing the
+	// last key of a tier without an anonymous fallback is refused so the
+	// gateway never strands itself mid-apply.
+	gateway.evictKey = func(tier config.Tier, key string) error {
+		_, err := m.Update(func(c *config.Config) error {
+			var keys *[]string
+			if tier == config.TierGo {
+				keys = &c.GoKeys
+			} else {
+				keys = &c.ZenKeys
+			}
+			remaining := make([]string, 0, max(len(*keys)-1, 0))
+			removed := false
+			for _, k := range *keys {
+				if !removed && k == key {
+					removed = true // drop only the first occurrence; duplicates stay
+					continue
+				}
+				remaining = append(remaining, k)
+			}
+			if !removed {
+				return errEvictionKeyGone
+			}
+			if len(remaining) == 0 && !c.Anonymous {
+				return errEvictionLastKey
+			}
+			*keys = remaining
+			return nil
+		})
+		return err
+	}
 	if cfg.TetherPool.Enabled {
 		gateway.tpSnapshot = &tpSnapshot
 	}
@@ -346,6 +379,7 @@ func (m *RuntimeController) start(runtime *gatewayRuntime) {
 	runtime.gateway.StartProxyHealthChecks(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
 	runtime.gateway.StartVersionSync(runtimeCtx)
+	runtime.gateway.StartEvictor(runtimeCtx)
 }
 
 // Handler returns the API handler, wrapped in the telemetry middleware. Each

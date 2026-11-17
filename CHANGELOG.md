@@ -4,6 +4,40 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.0 (2026-11-18) — automatic eviction of credential-dead keys
+
+A key the upstream keeps rejecting with 401/403 (a dead credential) now
+removes itself from the config instead of waiting for a manual cleanup.
+
+### Added
+
+- **Automatic eviction** (`internal/gateway/evictor.go`): after
+  `performance.credential_death_streak` (default 5) consecutive real-traffic
+  credential rejections, the key's eviction is armed for the end of its
+  credential quarantine (the observation window, `credential_quarantine_seconds`).
+  A background sweep then removes the key from `config.json` through the
+  standard read-modify-write apply — persisted atomically with a `.bak`, the
+  pool rebuilt, TetherPool re-provisioned. Any inference or quota-probe success
+  before the deadline cancels the eviction (`key_eviction_canceled`); refusing
+  to evict the last key of a tier while the anonymous lane is off keeps the
+  gateway from stranding itself. New events: `key_eviction_scheduled`,
+  `key_eviction_canceled`, `key_evicted`, `key_eviction_failed`,
+  `key_eviction_skipped` (last key) and healthz `keys.eviction_pending`.
+- **Cross-region binding reuse** (`internal/tetherpool/provision.go`): an
+  eviction shifts every later key's positional region, which used to change
+  cache keys and silently re-acquire exits. Surviving keys now keep their
+  sticky binding across a sibling key's removal — zero new acquires.
+
+### Changed
+
+- Quota-probe 401s (`quota_probe_still_credential_dead`) never count toward
+  the death streak: probes are a different request shape from real traffic,
+  and the probe loop's own repin path already keeps dead keys out of rotation.
+- A model-listing success still clears the credential quarantine but
+  deliberately neither resets the streak nor cancels a pending eviction: the
+  upstream answers listings even while it rejects inference credentials
+  (observed live on a dead key answering 200 listings against 401 inference).
+
 ## v1.7.3 (2026-11-14) — hot-path performance and memory optimization
 
 Pure performance and observability release; no external behavior changes.

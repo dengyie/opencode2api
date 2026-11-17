@@ -290,6 +290,15 @@ type PerformanceConfig struct {
 	// pre-v1.7 behavior (short cooldown only, 401 passthrough on pool
 	// exhaustion).
 	CredentialQuarantineSeconds int `json:"credential_quarantine_seconds"`
+	// CredentialDeathStreak (v1.8.0) is how many consecutive real-traffic
+	// credential rejections (401/403) arm an automatic eviction of the key
+	// from the config. The observation window is the credential quarantine
+	// stretch: the key is evicted once the quarantine lapses while the key
+	// stayed dead, and any inference or probe success before the deadline
+	// cancels the eviction. Quota-probe rejections do not count toward the
+	// streak — they are a different request shape from real traffic. 0 keeps
+	// the pre-v1.8 behavior: quarantine only, no automatic removal.
+	CredentialDeathStreak int `json:"credential_death_streak"`
 	// VersionSync (v1.7.2) tracks the official OpenCode client releases and
 	// keeps the v2 lane's masquerade version aligned with them. With
 	// auto_sync off it only detects and logs; auto_sync additionally
@@ -457,7 +466,7 @@ func Load(path string) (Config, error) {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, HeartbeatSeconds: 15, WallProbeTimeoutSeconds: 5, CredentialQuarantineSeconds: 86400},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, HeartbeatSeconds: 15, WallProbeTimeoutSeconds: 5, CredentialQuarantineSeconds: 86400, CredentialDeathStreak: 5},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -570,6 +579,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.CredentialQuarantineSeconds < 0 || cfg.Performance.CredentialQuarantineSeconds > 2592000 {
 		return Config{}, errors.New("performance.credential_quarantine_seconds must be between 0 and 2592000 (0 restores the legacy plain-cooldown behavior for 401/403)")
+	}
+	if cfg.Performance.CredentialDeathStreak < 0 || cfg.Performance.CredentialDeathStreak > 100 {
+		return Config{}, errors.New("performance.credential_death_streak must be between 0 and 100 (0 keeps the quarantine-only behavior for 401/403)")
 	}
 	if err := validateVersionSync(&cfg.Performance.VersionSync); err != nil {
 		return Config{}, err

@@ -104,6 +104,11 @@ type Gateway struct {
 	// provision state rendered in /healthz; nil when the integration is off.
 	tpRebind   chan<- tetherpool.RebindRequest
 	tpSnapshot *tetherpool.Snapshot
+	// evictKey (v1.8.0) removes a credential-dead key from the config and
+	// applies the change; the RuntimeController installs it. Nil (feature
+	// disabled or no controller) leaves scheduled evictions pending forever,
+	// which is safe: the key simply stays quarantined.
+	evictKey func(tier config.Tier, key string) error
 	// Empirical anonymous-wall signal (v1.5.3): the anonymous lane answered
 	// 429 free-usage-limit recently. count accumulates within the window and
 	// resets on a 2xx or when the window lapses; it lets the quota pre-check
@@ -158,6 +163,11 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	credentialQuarantine := time.Duration(cfg.Performance.CredentialQuarantineSeconds) * time.Second
 	zenNodes.credentialQuarantine = credentialQuarantine
 	goNodes.credentialQuarantine = credentialQuarantine
+	// v1.8.0: how many consecutive real-traffic credential rejections arm an
+	// automatic config eviction; zero keeps the pre-v1.8 quarantine-only
+	// behavior.
+	zenNodes.credentialDeathStreak = cfg.Performance.CredentialDeathStreak
+	goNodes.credentialDeathStreak = cfg.Performance.CredentialDeathStreak
 	catalog := models.Catalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
@@ -165,6 +175,11 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	// (empty = the compile-time claim), so out of the box auto-sync cannot
 	// claim a release the operator has not verified.
 	warnTimeoutCover(cfg, logger)
+	// v1.8.0: surface the arm and disarm of automatic evictions in the log;
+	// the pools stay log-free and the evictor logs the removal itself.
+	if cfg.Performance.CredentialDeathStreak > 0 {
+		installEvictionLogging(logger, zenNodes, goNodes)
+	}
 	return &Gateway{
 		cfg:            cfg,
 		rotation:       rotationManager,

@@ -127,6 +127,21 @@ func (p *Provisioner) Resolve(ctx context.Context, cfg config.Config, logger *sl
 		cacheKey := displayID + "|" + region
 		p.mu.Lock()
 		cached, ok := p.cache[cacheKey]
+		if !ok {
+			// v1.8.0: a config apply that removed a key shifts every later
+			// key's positional region, changing cache keys without changing
+			// keys. Reusing the binding the key already owns across regions
+			// keeps surviving keys' sticky egresses stable across a sibling
+			// key's eviction instead of re-acquiring new exits.
+			for cacheValue, binding := range p.cache {
+				if !strings.HasPrefix(cacheValue, displayID+"|") {
+					continue
+				}
+				cached, ok = binding, true
+				p.cache[cacheKey] = binding
+				break
+			}
+		}
 		p.mu.Unlock()
 		if ok {
 			bindings[i] = cached

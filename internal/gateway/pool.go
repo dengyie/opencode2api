@@ -623,6 +623,19 @@ type upstreamNode struct {
 	// rebindFiredAt (v1.6.0) is the last wall-triggered TetherPool battery
 	// report for this key, spacing reports rebind_min_interval_seconds apart.
 	rebindFiredAt atomic.Int64
+	// credStreak (v1.8.0) counts consecutive real-traffic credential
+	// rejections (401/403) seen by MarkFailure. Quota-probe rejections go
+	// through RepinCredentialQuarantine and never touch this counter, and a
+	// listing success (MarkListingSuccess) deliberately does not reset it —
+	// a listing only proves the endpoint answers, not that inference
+	// authenticates. Only a real inference success clears the streak.
+	credStreak atomic.Uint32
+	// evictAt (v1.8.0) is when the evictor may remove this credential-dead
+	// key from the config. Zero means no eviction is pending. It is armed by
+	// MarkFailure once credStreak reaches the pool's credentialDeathStreak,
+	// observation window = credentialQuarantine, and disarmed by any real
+	// inference or probe success before the deadline.
+	evictAt atomic.Int64
 	// uaVersion (v1.7.4) is the v2 client release this key claims in its
 	// User-Agent, drawn from the fingerprint pool by the key's fingerprint.
 	// Empty means the global claimed version: the anonymous lane and callers
@@ -648,6 +661,17 @@ type upstreamNodes struct {
 	// after a 401/403. Zero keeps the pre-v1.7 behavior: the ordinary failure
 	// cooldown only, with the key back in rotation when it expires.
 	credentialQuarantine time.Duration
+	// credentialDeathStreak (v1.8.0) is how many consecutive real-traffic
+	// credential rejections arm an automatic eviction of the key from the
+	// config once the credential quarantine (the observation window) lapses.
+	// Zero disables the feature. The RuntimeController reads the same value
+	// back to decide whether the evictor goroutine runs.
+	credentialDeathStreak int
+	// onEvictionScheduled / onEvictionCanceled (v1.8.0) surface the arm and
+	// disarm of an automatic eviction to the gateway logger; the pool itself
+	// stays log-free. Both are optional and installed by gateway.New.
+	onEvictionScheduled func(keyID string, streak uint32, evictAt time.Time)
+	onEvictionCanceled  func(keyID string)
 }
 
 // nodePool distributes keys over proxies in round-robin order. When there
@@ -889,6 +913,12 @@ func (p *upstreamNodes) MarkSuccess(node *upstreamNode) {
 	node.quotaUntil.Store(0)
 	node.credUntil.Store(0)
 	node.probeNextAt.Store(0)
+	// v1.8.0: a real inference success proves the credential alive — cancel a
+	// pending eviction and reset the credential streak entirely.
+	node.credStreak.Store(0)
+	if node.evictAt.Swap(0) != 0 && p.onEvictionCanceled != nil {
+		p.onEvictionCanceled(config.KeyDisplayID(node.key))
+	}
 }
 
 // MarkListingSuccess records that a model-catalog listing succeeded through
@@ -902,6 +932,11 @@ func (p *upstreamNodes) MarkListingSuccess(node *upstreamNode) {
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
 	node.credUntil.Store(0)
+	// v1.8.0 note: the credential streak and any pending eviction are
+	// deliberately left alone here. A listing succeeds even while inference
+	// rejects the credential (observed live on vJ7MJ), so a listing proves
+	// neither that inference authenticates nor that the streak is broken;
+	// only MarkSuccess may clear them.
 }
 
 // MarkFailure cools node down after an error or a 401, 403, 429 or 5xx
@@ -937,6 +972,17 @@ func (p *upstreamNodes) MarkFailure(node *upstreamNode, resp *http.Response, err
 		node.failures.Store(0) // the quarantine is not a streak; start clean on return
 		if p.quotaProbeInterval > 0 {
 			node.probeNextAt.Store(time.Now().Add(p.quotaProbeInterval).UnixNano())
+		}
+		// v1.8.0: count the streak and arm the eviction once it reaches the
+		// configured death streak. The observation window is the same
+		// quarantine stretch: if the key recovers (probe or real traffic
+		// succeeds) before evictAt lapses, MarkSuccess disarms the eviction.
+		streak := node.credStreak.Add(1)
+		if p.credentialDeathStreak > 0 && streak >= uint32(p.credentialDeathStreak) && node.evictAt.Load() == 0 {
+			node.evictAt.Store(credUntil.UnixNano())
+			if p.onEvictionScheduled != nil {
+				p.onEvictionScheduled(config.KeyDisplayID(node.key), streak, credUntil)
+			}
 		}
 	}
 }
@@ -1087,6 +1133,43 @@ func (p *upstreamNodes) RepinCredentialQuarantine(node *upstreamNode) {
 			node.cooldownUntil.Store(until)
 		}
 	}
+}
+
+// EvictionDueNodes returns the keys whose eviction deadline (v1.8.0) has
+// lapsed while their credential streak is still at or beyond the death
+// threshold — i.e. the key stayed credential-dead through the whole
+// observation window and may now be removed from the config. A key whose
+// streak was reset by a success before the deadline never appears here
+// because MarkSuccess cleared evictAt alongside the streak.
+func (p *upstreamNodes) EvictionDueNodes() []*upstreamNode {
+	if p == nil || p.credentialDeathStreak <= 0 {
+		return nil
+	}
+	due := make([]*upstreamNode, 0, 1)
+	now := time.Now().UnixNano()
+	for _, node := range p.nodes {
+		if evictAt := node.evictAt.Load(); evictAt != 0 && evictAt <= now &&
+			node.credStreak.Load() >= uint32(p.credentialDeathStreak) {
+			due = append(due, node)
+		}
+	}
+	return due
+}
+
+// EvictionPending counts the keys with an automatic eviction (v1.8.0) armed
+// but not yet due. Health exposes the number so a scheduled eviction is
+// visible before it executes.
+func (p *upstreamNodes) EvictionPending() int {
+	if p == nil || p.credentialDeathStreak <= 0 {
+		return 0
+	}
+	pending := 0
+	for _, node := range p.nodes {
+		if node.evictAt.Load() != 0 {
+			pending++
+		}
+	}
+	return pending
 }
 
 // AllQuotaCooled reports whether every key of this pool is quota-cooled and

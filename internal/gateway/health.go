@@ -67,6 +67,11 @@ type healthKeys struct {
 	// 401/403 quarantine (v1.7.0). It is informational: a quarantined key is
 	// still probed and returns automatically, so it does not affect ready.
 	CredentialQuarantined int `json:"credential_quarantined"`
+	// EvictionPending counts keys with an automatic config eviction (v1.8.0)
+	// armed but not yet due. Informational like the quarantine count: the
+	// eviction fires only if the key stays credential-dead through the whole
+	// observation window.
+	EvictionPending int `json:"eviction_pending"`
 }
 
 type healthProxies struct {
@@ -195,7 +200,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			CacheSource:       models.CacheSource,
 			Stale:             models.Stale,
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous, CredentialQuarantined: len(g.zenNodes.CredentialQuarantinedNodes()) + len(g.goNodes.CredentialQuarantinedNodes())},
+		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous, CredentialQuarantined: len(g.zenNodes.CredentialQuarantinedNodes()) + len(g.goNodes.CredentialQuarantinedNodes()), EvictionPending: g.zenNodes.EvictionPending() + g.goNodes.EvictionPending()},
 		Proxies: healthProxies{
 			Total:     proxyTotal,
 			Healthy:   proxyHealthy,
