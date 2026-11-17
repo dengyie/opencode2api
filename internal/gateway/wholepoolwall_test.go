@@ -168,9 +168,10 @@ func TestE2EWholePoolWallWithCredentialDeadKey(t *testing.T) {
 
 // The 01:16:13 production shape end to end: the wall armed at entry, the
 // probe-recovered keys hold a probation cooldown (quotaUntil already clear),
-// so HasUsableNode is false but the keys can still serve. The anonymous walk
-// must spend exactly one probe attempt and hand the request to the probation
-// key instead of burning every exit.
+// so no key is ready by the cursor's definition yet they can still serve via
+// the earliest-cooling fallback. The anonymous walk must spend exactly one
+// probe attempt and hand the request to the probation key instead of burning
+// every exit.
 func TestE2EWallProbeWithProbationKeys(t *testing.T) {
 	var anonCalls, keyCalls atomic.Int64
 	mux := http.NewServeMux()

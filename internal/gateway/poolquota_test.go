@@ -181,7 +181,7 @@ func TestMarkSuccessClearsCred(t *testing.T) {
 	}
 }
 
-// AllCredentialQuarantined mirrors AllQuotaCooled: partial pools are not a
+// AllCredentialQuarantined mirrors AllUnavailable: partial pools are not a
 // wall, an empty pool never is, and the earliest reopening wins.
 func TestAllCredentialQuarantined(t *testing.T) {
 	pool := testKeyPool(0, 0)
