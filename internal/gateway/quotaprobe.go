@@ -336,8 +336,10 @@ func (g *Gateway) wallProbeAttemptTimeout() time.Duration {
 	return probe
 }
 
-// quotaWall reports whether the request's possible lanes are all quota-cooled,
-// and when the first key reopens. The anonymous lane must be unable to take
+// quotaWall reports whether the request's possible key lanes are all
+// unavailable with at least one genuine quota wall among them (v1.8.3
+// tri-state), and when the first key reopens. The anonymous lane must be
+// unable to take
 // the request — disabled, paused by its breaker, or empirically walled (its
 // own recent 429s) — because it is either the route's primary lane
 // (route.Anonymous free-model traffic, the tebi shape) or the key lanes'
