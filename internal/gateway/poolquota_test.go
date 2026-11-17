@@ -216,8 +216,8 @@ func TestCredentialQuarantinedSkippedByNext(t *testing.T) {
 	quarantined := pool.nodes[1]
 	pool.MarkFailure(quarantined, credResponse(http.StatusForbidden, ""), nil)
 	now := time.Now().UnixNano()
-	if usable := pool.HasUsableNode(); !usable {
-		t.Fatal("two healthy keys must keep the pool usable")
+	if _, all, _ := pool.AllUnavailable(); all {
+		t.Fatal("two healthy keys must keep the pool from reading as fully unavailable")
 	}
 	if quarantined.cooldownUntil.Load() < now {
 		t.Fatal("the quarantined key must be held out of rotation")
@@ -357,22 +357,23 @@ func TestMarkSuccessClearsQuota(t *testing.T) {
 	}
 }
 
-// AllQuotaCooled reports the earliest recovery and refuses partially free pools.
-func TestAllQuotaCooled(t *testing.T) {
+// AllUnavailable reports the earliest recovery, the quota flag, and refuses
+// partially free pools.
+func TestAllUnavailable(t *testing.T) {
 	pool := testKeyPool(3, 0)
-	if _, ok := pool.AllQuotaCooled(); ok {
+	if _, ok, _ := pool.AllUnavailable(); ok {
 		t.Fatal("empty-ish pool without keys marked cannot be walled")
 	}
 	now := time.Now()
 	pool.nodes[0].quotaUntil.Store(now.Add(time.Hour).UnixNano())
-	if _, ok := pool.AllQuotaCooled(); ok {
+	if _, ok, _ := pool.AllUnavailable(); ok {
 		t.Fatal("one cooled key of three is not a wall")
 	}
 	pool.nodes[1].quotaUntil.Store(now.Add(2 * time.Hour).UnixNano())
 	pool.nodes[2].quotaUntil.Store(now.Add(30 * time.Minute).UnixNano())
-	earliest, ok := pool.AllQuotaCooled()
-	if !ok {
-		t.Fatal("all keys cooled must report a wall")
+	earliest, ok, quotaWalled := pool.AllUnavailable()
+	if !ok || !quotaWalled {
+		t.Fatal("all keys cooled must report a quota wall")
 	}
 	if want := now.Add(30 * time.Minute); earliest.Sub(want) > time.Minute || want.Sub(earliest) > time.Minute {
 		t.Fatalf("earliest = %v, want about %v", earliest, want)
@@ -380,13 +381,13 @@ func TestAllQuotaCooled(t *testing.T) {
 }
 
 // Empty and nil pools never report a wall (nothing to pre-check).
-func TestAllQuotaCooledEmpty(t *testing.T) {
+func TestAllUnavailableEmpty(t *testing.T) {
 	pool := testKeyPool(0, 0)
-	if _, ok := pool.AllQuotaCooled(); ok {
+	if _, ok, _ := pool.AllUnavailable(); ok {
 		t.Fatal("an empty pool must not report a wall")
 	}
 	var nilPool *upstreamNodes
-	if _, ok := nilPool.AllQuotaCooled(); ok {
+	if _, ok, _ := nilPool.AllUnavailable(); ok {
 		t.Fatal("a nil pool must not report a wall")
 	}
 }

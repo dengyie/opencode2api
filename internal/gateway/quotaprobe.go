@@ -172,6 +172,14 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 		// event keeps a long-quarantined key visible instead of reading as
 		// inconclusive churn.
 		nodes.RepinCredentialQuarantine(node)
+		// v1.8.3: the probe is an inference-shaped request through the key,
+		// so its 401/403 is the same credential verdict real traffic would
+		// get — count it toward the death streak. v1.8.0 excluded probes on
+		// the assumption real traffic keeps reaching dead keys; the v1.8.2
+		// whole-pool pre-check breaks that assumption (a walled pool
+		// pre-check-blocks every live request, leaving the probe as the only
+		// observer). Cancel-on-success still disarms everything.
+		nodes.noteCredentialDeath(node, time.Unix(0, node.credUntil.Load()))
 		g.logger.Info("quota probe still credential-dead", "component", "upstream", "event", "quota_probe_still_credential_dead", "tier", tier, "key_id", config.KeyDisplayID(node.key), "model", model, "reason", result.reason)
 	} else {
 		g.logger.Debug("quota probe inconclusive", "component", "upstream", "event", "quota_probe_inconclusive", "tier", tier, "key_id", config.KeyDisplayID(node.key), "reason", result.reason)
@@ -346,26 +354,33 @@ func (g *Gateway) quotaWall() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	walled := false
+	quotaSeen := false
 	earliest := time.Time{}
 	if zenConfigured {
-		until, ok := g.zenNodes.AllQuotaCooled()
-		if !ok {
+		until, all, quota := g.zenNodes.AllUnavailable()
+		if !all {
 			return time.Time{}, false
 		}
 		walled = true
+		quotaSeen = quotaSeen || quota
 		earliest = until
 	}
 	if goConfigured {
-		until, ok := g.goNodes.AllQuotaCooled()
-		if !ok {
+		until, all, quota := g.goNodes.AllUnavailable()
+		if !all {
 			return time.Time{}, false
 		}
 		walled = true
+		quotaSeen = quotaSeen || quota
 		if earliest.IsZero() || until.Before(earliest) {
 			earliest = until
 		}
 	}
-	if !walled || earliest.IsZero() {
+	// v1.8.3: the quota verdict needs every configured pool fully unavailable
+	// and at least one genuine quota wall across them. An all-credential pool
+	// reports quota=false, so a purely credential wall stands down here and
+	// credentialWall keeps the 503 classification.
+	if !walled || !quotaSeen || earliest.IsZero() {
 		return time.Time{}, false
 	}
 	return earliest, true

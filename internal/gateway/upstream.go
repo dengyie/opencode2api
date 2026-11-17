@@ -417,12 +417,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		limit = g.cfg.Retry.MaxAttempts
 	}
 	// Empirical-wall fast failover (v1.5.6, recapped v1.8.2): while the lane
-	// is 429-walled, one exit attempt is enough to catch the wall lifting —
-	// whether the keys take over (a usable key gets the rest of the first-token
-	// budget) or the handler synthesizes the fast 429 (every key walled too).
-	// The probe itself is bounded by wall_probe_timeout_seconds (v1.5.7): a
-	// walled exit can spend 2–17s before answering, which alone can exhaust
-	// the caller's budget before anything else gets its turn.
+	// is 429-walled and the route can fall to Zen keys, one exit attempt is
+	// enough to catch the wall lifting — the keys take over, or (every key
+	// walled too) the handler synthesizes the fast 429. Routes without a Zen
+	// tier keep the full walk: the exits are their only lane and shrinking
+	// the attempt timeout there would hurt them when the wall is stale; the
+	// mid-walk arm check below caps those at two legs instead. The probe
+	// itself is bounded by wall_probe_timeout_seconds (v1.5.7): a walled exit
+	// can spend 2–17s before answering, which alone can exhaust the caller's
+	// budget before anything else gets its turn.
 	attemptTimeout := g.attemptTimeout
 	if g.anonWallFastFailover() && slices.Contains(route.KeyTiers, config.TierZen) {
 		limit = min(limit, 1)

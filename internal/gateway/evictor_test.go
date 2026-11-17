@@ -135,15 +135,34 @@ func TestEvictionDueNodesAfterWindowLapses(t *testing.T) {
 	}
 }
 
-// The quota-probe path never counts toward the streak: RepinCredentialQuarantine
-// does not touch credStreak or evictAt.
-func TestQuotaProbeRepinDoesNotCountTowardStreak(t *testing.T) {
+// A probe 401 counts toward the streak exactly like real traffic (v1.8.3):
+// noteCredentialDeath arms the eviction at the quarantine in effect, but a
+// key with no quarantine window only accumulates the streak.
+func TestNoteCredentialDeathFromProbe(t *testing.T) {
 	pool := testEvictPool(1, 5, time.Hour)
 	node := pool.nodes[0]
-	node.credUntil.Store(time.Now().Add(30 * time.Minute).UnixNano())
-	pool.RepinCredentialQuarantine(node)
-	if node.credStreak.Load() != 0 || node.evictAt.Load() != 0 {
-		t.Fatal("probe repins must not count toward the death streak")
+	// Below the threshold: streak advances, nothing arms.
+	pool.noteCredentialDeath(node, time.Now().Add(time.Hour))
+	if node.credStreak.Load() != 1 || node.evictAt.Load() != 0 {
+		t.Fatal("a sub-threshold death must not arm the eviction")
+	}
+	// Reaching the threshold with a live quarantine arms at that window.
+	window := time.Now().Add(time.Hour)
+	for i := 0; i < 4; i++ {
+		pool.noteCredentialDeath(node, window)
+	}
+	if node.credStreak.Load() != 5 || node.evictAt.Load() == 0 {
+		t.Fatal("reaching the death streak must arm evictAt")
+	}
+	// A probe 401 on a not-yet-quarantined key advances the streak but cannot
+	// arm: there is no observation window.
+	pool2 := testEvictPool(1, 5, time.Hour)
+	bare := pool2.nodes[0]
+	for i := 0; i < 5; i++ {
+		pool2.noteCredentialDeath(bare, time.Time{})
+	}
+	if bare.credStreak.Load() != 5 || bare.evictAt.Load() != 0 {
+		t.Fatal("a streak without a quarantine window must not arm")
 	}
 }
 
@@ -194,7 +213,7 @@ func TestEvictDueKeysCallbackFailureStopsSweep(t *testing.T) {
 }
 
 // Probation (v1.8.1) sets a soft cooldown only: cooldownUntil moves out,
-// quotaUntil stays zero so AllQuotaCooled and the pre-checks are untouched,
+// quotaUntil stays zero so AllUnavailable and the pre-checks are untouched,
 // and the selection cursor demotes the key while uncooled peers exist.
 func TestMarkProbationSoftCooldownOnly(t *testing.T) {
 	pool := testKeyPool(2, 10*time.Minute)
@@ -206,8 +225,8 @@ func TestMarkProbationSoftCooldownOnly(t *testing.T) {
 	if node.quotaUntil.Load() != 0 {
 		t.Fatal("probation must not touch quotaUntil (pre-check semantics)")
 	}
-	if _, all := pool.AllQuotaCooled(); all {
-		t.Fatal("a probation must never read as a quota wall")
+	if _, all, _ := pool.AllUnavailable(); all {
+		t.Fatal("a probation must never read as a whole-pool wall")
 	}
 	if node.probeNextAt.Load() != 0 {
 		t.Fatal("probation must not schedule probes")

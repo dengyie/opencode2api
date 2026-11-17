@@ -4,6 +4,38 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.3 (2026-11-18) — review fixes: cross-pool wall verdict, probe-counted death streak, dead code removal
+
+Root-cause pass over the v1.8.2 production review findings.
+
+### Fixed
+
+- **Cross-pool mixed-class walls now pre-check** (`internal/gateway/pool.go`,
+  `internal/gateway/quotaprobe.go`): `AllQuotaCooled` becomes `AllUnavailable`
+  with a tri-state verdict — (earliest reopen, all keys unavailable, any
+  quota wall). `quotaWall` now fires when every configured pool is fully
+  unavailable and at least one has a genuine quota wall, so the shape
+  "zen all-quota-walled + go all-credential-quarantined" no longer slips past
+  the entry pre-check and the mid-walk fast fail. An all-credential pool
+  reports `quota=false`, keeping the credential pre-check's 503
+  classification (now pinned end to end).
+- **Probe credential rejections count toward the death streak**
+  (`pool.go` `noteCredentialDeath`, `quotaprobe.go`): v1.8.0 excluded probe
+  401s assuming real traffic keeps reaching dead keys; the v1.8.2
+  whole-pool pre-check breaks that assumption — a walled pool never routes
+  live traffic to a quarantined key, so the probe is the only observer left.
+  The probe is an inference-shaped request through the key, so its 401/403
+  is the same credential verdict; the streak and eviction arming now come
+  from one shared `noteCredentialDeath`, called by both MarkFailure and the
+  probe branch. Cancel-on-success semantics unchanged; a probe 401 on a
+  not-yet-quarantined key advances the streak but cannot arm (no window).
+
+### Removed
+
+- `upstreamNodes.HasUsableNode`: its only production caller
+  (`anonWallFastFailover`) was dropped in v1.8.2; the method and its tests
+  are gone.
+
 ## v1.8.2 (2026-11-18) — whole-pool wall judgment counts credential-dead keys; the walled anonymous walk always caps
 
 Post-deploy review of v1.8.1 (1.5h of tebi traffic) left three 499s sharing

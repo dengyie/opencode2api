@@ -113,8 +113,8 @@ func TestE2EQuotaWallFastFail(t *testing.T) {
 		t.Fatalf("the walk must cut short well before MaxAttempts, got %d upstream calls", got)
 	}
 	// Every walled key must carry the adopted Retry-After horizon.
-	if _, all := g.zenNodes.AllQuotaCooled(); !all {
-		t.Fatal("all keys must be quota-cooled after the walk")
+	if _, all, _ := g.zenNodes.AllUnavailable(); !all {
+		t.Fatal("all keys must be unavailable after the walk")
 	}
 }
 

@@ -24,32 +24,6 @@ import (
 // cover the decision helper, the pool predicate it reads, and the end-to-end
 // walk cap against a fake upstream.
 
-func TestHasUsableNode(t *testing.T) {
-	transports, err := transportPool([]string{"direct", "direct"}, config.PerformanceConfig{}, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	nodes, err := nodePool([]string{"k1", "k2"}, transports, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !nodes.HasUsableNode() {
-		t.Fatal("a fresh pool must report a usable node")
-	}
-	nodes.MarkFailure(nodes.nodes[0], quotaResponse("3600"), nil)
-	if !nodes.HasUsableNode() {
-		t.Fatal("one cooled key must not unusable the whole pool")
-	}
-	nodes.MarkFailure(nodes.nodes[1], quotaResponse("3600"), nil)
-	if nodes.HasUsableNode() {
-		t.Fatal("every key cooled: the pool must report no usable node")
-	}
-	var empty *upstreamNodes
-	if empty.HasUsableNode() {
-		t.Fatal("a nil pool must report no usable node")
-	}
-}
-
 func TestAnonWallFastFailover(t *testing.T) {
 	upstream := fakeUpstream(t, nil)
 	g := gatewayFor(t, upstream.URL, `{"max_attempts": 1, "timeout_seconds": 30}`, `{"heartbeat_seconds": 0}`)

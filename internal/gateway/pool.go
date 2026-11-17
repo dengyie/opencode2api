@@ -977,13 +977,7 @@ func (p *upstreamNodes) MarkFailure(node *upstreamNode, resp *http.Response, err
 		// configured death streak. The observation window is the same
 		// quarantine stretch: if the key recovers (probe or real traffic
 		// succeeds) before evictAt lapses, MarkSuccess disarms the eviction.
-		streak := node.credStreak.Add(1)
-		if p.credentialDeathStreak > 0 && streak >= uint32(p.credentialDeathStreak) && node.evictAt.Load() == 0 {
-			node.evictAt.Store(credUntil.UnixNano())
-			if p.onEvictionScheduled != nil {
-				p.onEvictionScheduled(config.KeyDisplayID(node.key), streak, credUntil)
-			}
-		}
+		p.noteCredentialDeath(node, credUntil)
 	}
 }
 
@@ -1000,23 +994,6 @@ func (p *upstreamNodes) cooldownFor(node *upstreamNode, resp *http.Response, err
 		}
 	}
 	return delay
-}
-
-// HasUsableNode reports whether any key of this pool is currently usable: its
-// cooldown, which includes a quota wall (a 429 sets both), has expired. The
-// anonymous walk consults this before cutting its exit cap short — an early
-// handover to the key tiers is only worth it when a key can actually serve.
-func (p *upstreamNodes) HasUsableNode() bool {
-	if p == nil {
-		return false
-	}
-	now := time.Now().UnixNano()
-	for _, node := range p.nodes {
-		if node.cooldownUntil.Load() <= now {
-			return true
-		}
-	}
-	return false
 }
 
 // QuotaCooledNodes returns the pool's keys that are currently quota-cooled.
@@ -1050,7 +1027,7 @@ func (p *upstreamNodes) CredentialQuarantinedNodes() []*upstreamNode {
 	return quarantined
 }
 
-// AllCredentialQuarantined mirrors AllQuotaCooled for the credential class
+// AllCredentialQuarantined mirrors AllUnavailable for the credential class
 // (v1.7.0): whether every key of this pool is currently quarantined after a
 // 401/403 and when the first one reopens. The credential pre-check uses this
 // to reject a request with zero upstream calls instead of burning attempts
@@ -1135,13 +1112,39 @@ func (p *upstreamNodes) RepinCredentialQuarantine(node *upstreamNode) {
 	}
 }
 
+// noteCredentialDeath advances a key's credential-death streak by one and
+// arms the eviction once the streak reaches the configured death count
+// (v1.8.0). v1.8.3 widened the callers from real-traffic 401/403 alone to the
+// quota probe's 401/403 as well: the probe is an inference-shaped request
+// through the key, and since v1.8.2 the whole-pool pre-check blocks live
+// traffic whenever every usable key is walled — a walled pool then never
+// reaches a dead key with real traffic, and the probe is the only observer
+// left (the original probe exclusion assumed real traffic keeps flowing).
+// The observation window is the credential quarantine in effect at the call;
+// a probe 401 on a not-yet-quarantined key advances the streak but cannot
+// arm — real traffic quarantines the key on its next 401 and arms from that
+// fresh window. Any success (MarkSuccess) resets the streak and cancels.
+func (p *upstreamNodes) noteCredentialDeath(node *upstreamNode, credUntil time.Time) {
+	if p == nil || node == nil {
+		return
+	}
+	streak := node.credStreak.Add(1)
+	if p.credentialDeathStreak > 0 && streak >= uint32(p.credentialDeathStreak) &&
+		node.evictAt.Load() == 0 && credUntil.After(time.Now()) {
+		node.evictAt.Store(credUntil.UnixNano())
+		if p.onEvictionScheduled != nil {
+			p.onEvictionScheduled(config.KeyDisplayID(node.key), streak, credUntil)
+		}
+	}
+}
+
 // MarkProbation (v1.8.1) puts a freshly probe-recovered key on a short soft
 // cooldown: the selection cursor (Next reads cooldownUntil only) demotes it
 // to the earliest-cooling fallback bucket, so hot traffic reaches keys that
 // were never walled first, and the recovered key stops absorbing the burst
 // that re-walled it within seconds (151 probe recoveries → immediate re-429
 // in production). Deliberately does NOT touch quotaUntil — that field feeds
-// AllQuotaCooled and the pre-checks, and a probation that looked like a wall
+// AllUnavailable and the pre-checks, and a probation that looked like a wall
 // would keep whole-pool rejections firing. Nothing clears a probation early:
 // it lapses passively, and the quota probe loop has no business with it.
 func (p *upstreamNodes) MarkProbation(node *upstreamNode, d time.Duration) {
@@ -1190,22 +1193,23 @@ func (p *upstreamNodes) EvictionPending() int {
 	return pending
 }
 
-// AllQuotaCooled reports whether every key of this pool is unavailable to
-// inference traffic, and when the first one reopens. A key is unavailable
-// while quota-cooled (quotaUntil) or credential-quarantined (credUntil):
-// v1.8.2 adds the credential leg because a 401-dead key holds quotaUntil=0,
-// which used to keep whole-pool judgments false on mixed pools — the entry
-// pre-check and the mid-walk fast fail then never fired even when every
-// usable key was walled (the 2026-11-18 tebi 499s). The verdict still needs
-// at least one genuine quota wall: an all-credential pool reports false so
-// the caller's credentialWall keeps the 503 classification.
-func (p *upstreamNodes) AllQuotaCooled() (time.Time, bool) {
+// AllUnavailable reports whether every key of this pool is unavailable to
+// inference traffic, when the first one reopens, and whether any key is
+// quota-walled. A key is unavailable while quota-cooled (quotaUntil) or
+// credential-quarantined (credUntil): v1.8.2 added the credential leg because
+// a 401-dead key holds quotaUntil=0, which used to keep whole-pool judgments
+// false on mixed pools — the entry pre-check and the mid-walk fast fail then
+// never fired even when every usable key was walled (the 2026-11-18 tebi
+// 499s). The quota flag separates wall classes for the caller: a pool whose
+// keys are all credential-quarantined reports all=true with quota=false, so
+// quotaWall stands down and credentialWall keeps the 503 classification —
+// including the cross-pool shape (v1.8.3: zen all-quota + go all-credential
+// used to kill the whole verdict and skip the pre-check).
+func (p *upstreamNodes) AllUnavailable() (earliest time.Time, all, quotaWalled bool) {
 	if p == nil || len(p.nodes) == 0 {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	now := time.Now().UnixNano()
-	earliest := time.Time{}
-	quotaWalled := false
 	for _, node := range p.nodes {
 		until := node.quotaUntil.Load()
 		if until > now {
@@ -1215,16 +1219,13 @@ func (p *upstreamNodes) AllQuotaCooled() (time.Time, bool) {
 			until = cred
 		}
 		if until <= now {
-			return time.Time{}, false
+			return time.Time{}, false, false
 		}
 		if earliest.IsZero() || until < earliest.UnixNano() {
 			earliest = time.Unix(0, until)
 		}
 	}
-	if !quotaWalled {
-		return time.Time{}, false
-	}
-	return earliest, true
+	return earliest, true, quotaWalled
 }
 
 // parseRetryAfter reads a Retry-After header in delta-seconds or HTTP-date
