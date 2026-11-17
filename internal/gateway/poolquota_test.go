@@ -3,8 +3,13 @@ package gateway
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -533,8 +538,9 @@ func TestQuotaProbeModelPrefersObservedNonReasoning(t *testing.T) {
 // a walled key's Retry-After runs for hours, so skipping it in favor of any
 // uncooled peer is the whole point. The all-walled pool still returns the
 // earliest-reopening key (the pre-check and fast-fail semantics rely on that
-// fallback shape), and a healthy proxy's walled key loses to an uncooled key
-// on an unhealthy proxy only after every healthy-proxy key is exhausted.
+// fallback shape). The pool's nodes carry no transports, so every proxy reads
+// unhealthy and the walk serves through the ready fallback; the invariant
+// under test is that the walled key is never first while a peer is ready.
 func TestNextSkipsQuotaWalledKey(t *testing.T) {
 	pool := testKeyPool(3, 10*time.Minute)
 	walled, fresh := pool.nodes[0], pool.nodes[1]
@@ -570,5 +576,82 @@ func TestNextSkipsQuotaWalledKey(t *testing.T) {
 	got := cursor.Next()
 	if got != fresh {
 		t.Fatalf("an all-walled pool must return the earliest reopening key, got %q", got.key)
+	}
+}
+
+// v1.8.7 follow-up: a fully quota-walled pool must still refresh the model
+// catalog. The listing endpoint answers independently of the inference quota
+// window, so the refresh cursor — which falls back to the earliest-reopening
+// key when the whole pool is walled — must reach the upstream through it.
+// This pins the all-walled fallback shape that the v1.8.7 cursor change
+// deliberately preserved.
+func TestRefreshTierSucceedsThroughAllWalledPool(t *testing.T) {
+	var listingCalls, inferenceCalls atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		listingCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"mimo-v2.6-flash-free"},{"id":"glm-5.3-flash-free"}]}`))
+	})
+	// Inference answers 429 with a one-hour wall: every key gets walled as
+	// soon as traffic touches it.
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
+		inferenceCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"Free usage limit reached","type":"upstream_error"}}`))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	doc := `{
+		"listen": "127.0.0.1:0",
+		"server_keys": ["sk-local"],
+		"zen_keys": ["sk-zen-1", "sk-zen-2", "sk-zen-3"],
+		"anonymous": false,
+		"proxies": ["direct"],
+		"upstream": {"zen": "` + server.URL + `", "go": "` + server.URL + `"},
+		"retry": {"max_attempts": 3, "timeout_seconds": 30},
+		"models": {"refresh_seconds": 300},
+		"performance": {"heartbeat_seconds": 0, "quota_probe_seconds": 0}
+	}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	g, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})), nil, nil)
+	if err != nil {
+		t.Fatalf("gateway: %v", err)
+	}
+	// All three keys walled through the inference endpoint (MarkFailure sets
+	// cooldownUntil == quotaUntil an hour out).
+	for _, node := range g.zenNodes.nodes {
+		g.zenNodes.MarkFailure(node, quotaResponse("3600"), nil)
+	}
+
+	models := g.refreshTier(context.Background(), server.URL, g.zenNodes)
+	if len(models) == 0 {
+		t.Fatal("refreshTier must succeed through an all-walled pool (listing is quota-independent)")
+	}
+	if !strings.Contains(strings.Join(models, ","), "mimo-v2.6-flash-free") {
+		t.Fatalf("unexpected listing: %v", models)
+	}
+	if listingCalls.Load() == 0 {
+		t.Fatal("the listing endpoint must have been called")
+	}
+	if inferenceCalls.Load() != 0 {
+		t.Fatalf("a listing must never touch the inference endpoint, got %d calls", inferenceCalls.Load())
+	}
+	// The walled keys stay walled: a listing proves the credential, not the
+	// quota window (MarkListingSuccess semantics, v1.5.0).
+	for i, node := range g.zenNodes.nodes {
+		if node.quotaUntil.Load() == 0 {
+			t.Fatalf("key %d must remain quota-walled after a listing success", i)
+		}
 	}
 }
