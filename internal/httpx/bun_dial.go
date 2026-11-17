@@ -23,11 +23,14 @@ import (
 // http.DefaultTransport.
 const bunHandshakeTimeout = 10 * time.Second
 
-// bunClientHello returns the ClientHello of Bun's fetch, captured from Bun
-// 1.4.3. Bun links its own BoringSSL, so the hello is the same on every
-// platform: JA4 t13d1713h1, no GREASE, no padding, http/1.1 as the only ALPN
-// protocol and X25519MLKEM768 as the first key share. uTLS keeps handshake
-// state in the extensions, so every connection needs a fresh spec.
+// bunClientHello returns the ClientHello of the Bun runtime the official
+// OpenCode CLI embeds, re-captured on 2026-11-18 from opencode 1.18.35 (and
+// byte-confirmed identical to a standalone Bun 1.3.14 fetch): JA4 t13d1713h1,
+// no GREASE, no padding, http/1.1 as the only ALPN protocol. Notably the
+// embedded Bun does NOT offer X25519MLKEM768 — the earlier Bun 1.4.3 capture
+// did, which made the gateway's hello 1473B against the official 251B and the
+// only structural outlier in the whole hello. uTLS keeps handshake state in
+// the extensions, so every connection needs a fresh spec.
 func bunClientHello() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS12,
@@ -56,7 +59,7 @@ func bunClientHello() *utls.ClientHelloSpec {
 			&utls.SNIExtension{},
 			&utls.ExtendedMasterSecretExtension{},
 			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
-			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{utls.X25519MLKEM768, utls.X25519, utls.CurveP256, utls.CurveP384}},
+			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{utls.X25519, utls.CurveP256, utls.CurveP384}},
 			&utls.SupportedPointsExtension{SupportedPoints: []uint8{0}},
 			&utls.SessionTicketExtension{},
 			&utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}},
@@ -73,7 +76,7 @@ func bunClientHello() *utls.ClientHelloSpec {
 				utls.PKCS1WithSHA1,
 			}},
 			&utls.SCTExtension{},
-			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519MLKEM768}, {Group: utls.X25519}}},
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{{Group: utls.X25519}}},
 			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
 			&utls.SupportedVersionsExtension{Versions: []uint16{utls.VersionTLS13, utls.VersionTLS12}},
 		},

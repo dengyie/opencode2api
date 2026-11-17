@@ -4,6 +4,38 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.4 (2026-11-18) — TLS fingerprint re-capture: match the official client's embedded Bun, unify model listings
+
+A three-way ClientHello capture (gateway `BunTransport` vs the official
+opencode 1.18.35 binary vs a standalone Bun fetch, all against a local
+ClientHello-recording endpoint) found the gateway's hello structurally
+identical to the official client except one thing: the spec had been captured
+from Bun 1.4.3, whose BoringSSL offers X25519MLKEM768 — the embedded Bun the
+official CLI ships does not. That made the gateway's ClientHello 1473 bytes
+against the official 251, with the post-quantum key share the only
+structural outlier in an otherwise byte-identical hello.
+
+### Changed
+
+- **`bunClientHello` re-captured to the official population**
+  (`internal/httpx/bun_dial.go`): dropped X25519MLKEM768 from
+  supported_groups and the key share extension. The gateway's ClientHello is
+  now byte-identical to the official client's (modulo random, session id and
+  the ephemeral key share). Verified three ways: local byte diff, a live
+  handshake against the real upstream edge (200), and the full test suite.
+- **Model listings leave through the Bun transport too**
+  (`internal/gateway/refresh.go`): the zen-side `/v1/models` refresh used the
+  plain Go transport while inference used Bun TLS — same key, same egress,
+  two different hello families, exactly the cross-surface tie an upstream
+  could use to mark the client non-official. Both the anonymous and keyed
+  listing paths now go through `proxy.bun`.
+
+### Added
+
+- `TestCaptureClientHello` (env-guarded) and `TestBunLiveUpstreamHandshake`:
+  the capture-and-diff harness this fix was validated with, kept so the next
+  drift check is one command away.
+
 ## v1.8.3 (2026-11-18) — review fixes: cross-pool wall verdict, probe-counted death streak, dead code removal
 
 Root-cause pass over the v1.8.2 production review findings.

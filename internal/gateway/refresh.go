@@ -277,9 +277,13 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		var status int
 		var err error
 		// List models on the configured v2 /inference origin; the v1 fallback
-		// is retired (see anonymousUpstreams).
+		// is retired (see anonymousUpstreams). The listing leaves through the
+		// Bun transport like inference does (v1.8.4): same key, same egress,
+		// same TLS fingerprint — a Go hello on /v1/models next to a Bun hello
+		// on /inference would let the upstream tie the two surfaces to one
+		// non-official client.
 		for _, upstream := range g.anonymousUpstreams() {
-			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.client, upstream, anonymousZenKey, "")
+			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.bun, upstream, anonymousZenKey, "")
 			if err == nil || isProxyFailure(err) {
 				break
 			}
@@ -361,7 +365,7 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *upstreamN
 			cancel()
 			return nil
 		}
-		models, status, err := modelcatalog.FetchModels(refreshCtx, proxy.client, base, node.key, node.uaVersion)
+		models, status, err := modelcatalog.FetchModels(refreshCtx, proxy.bun, base, node.key, node.uaVersion)
 		g.syncProxyResult(refreshCtx, proxy, status, err)
 		cancel()
 		if err == nil {
