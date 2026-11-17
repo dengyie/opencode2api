@@ -297,17 +297,17 @@ func (g *Gateway) anonymousLaneWalled() bool {
 	return g.anonWallCount.Load() >= 2
 }
 
-// anonWallFastFailover reports whether the anonymous walk should hand the
-// request to the key tiers after a single attempt: the lane is empirically
-// 429-walled (two within the window) and at least one Zen key is currently
-// usable. Walking every exit through a walled lane burns the caller's
-// first-token budget before the keys ever see the request (each 429 costs
-// 1.7–26s in production), so the fronting gateway cancels at its TTFT gate
-// and the key fallback never completes. One attempt still catches the wall
-// lifting; with no usable key the walk keeps its full cap, because the exits
-// are then the only lane that can answer.
+// anonWallFastFailover reports whether the anonymous walk should cap itself
+// at a single probe attempt: the lane is empirically 429-walled (two
+// observations within the window). v1.5.6 applied the cap only while a Zen
+// key could take over; v1.8.2 drops that condition — with every key walled
+// too (the tebi shape of 2026-11-18 00:14/01:16) the uncapped walk burned
+// 5–7 exits and the caller's whole 30s budget on 429s before the client
+// cancelled (499), where one bounded probe answers the same question and the
+// handler synthesizes the pre-check's fast 429. One attempt still catches the
+// wall lifting: a probe that answers 200 serves the request directly.
 func (g *Gateway) anonWallFastFailover() bool {
-	return g.anonymousLaneWalled() && g.zenNodes.HasUsableNode()
+	return g.anonymousLaneWalled()
 }
 
 // wallProbeAttemptTimeout bounds the single anonymous attempt a wall fast

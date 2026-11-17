@@ -416,12 +416,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
 		limit = g.cfg.Retry.MaxAttempts
 	}
-	// Empirical-wall fast failover (v1.5.6): while the lane is 429-walled and
-	// a Zen key can take over, one exit attempt is enough to catch the wall
-	// lifting — the rest of the first-token budget belongs to the keys. The
-	// probe itself is bounded by wall_probe_timeout_seconds (v1.5.7): a walled
-	// exit can spend 2–17s before answering, which alone can exhaust the
-	// caller's budget before the key gets its turn.
+	// Empirical-wall fast failover (v1.5.6, recapped v1.8.2): while the lane
+	// is 429-walled, one exit attempt is enough to catch the wall lifting —
+	// whether the keys take over (a usable key gets the rest of the first-token
+	// budget) or the handler synthesizes the fast 429 (every key walled too).
+	// The probe itself is bounded by wall_probe_timeout_seconds (v1.5.7): a
+	// walled exit can spend 2–17s before answering, which alone can exhaust
+	// the caller's budget before anything else gets its turn.
 	attemptTimeout := g.attemptTimeout
 	if g.anonWallFastFailover() && slices.Contains(route.KeyTiers, config.TierZen) {
 		limit = min(limit, 1)
@@ -582,6 +583,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			// This attempt tripped the breaker (or another request did):
 			// continuing the walk would keep probing a lane that is now
 			// paused.
+			break
+		}
+		if nodeResp != nil && nodeResp.StatusCode == http.StatusTooManyRequests && g.anonymousLaneWalled() {
+			// This request's own 429s just armed the empirical wall (v1.8.2):
+			// a burst-start request used to walk every remaining exit through
+			// the same free-tier wall. Two exits within the window are the
+			// signal's own robustness bar, so honor it here and stop — the
+			// next request enters with the one-probe cap already armed.
+			g.logger.Info("anonymous wall armed mid-walk; stopping the exit walk", "component", "upstream", "event", "anon_wall_armed_midwalk", "request_id", ids.Request, "attempts", attempts)
 			break
 		}
 	}

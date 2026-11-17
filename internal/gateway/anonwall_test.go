@@ -17,11 +17,12 @@ import (
 	"opencode2api/internal/models"
 )
 
-// The v1.5.6 empirical-wall fast failover: while the anonymous lane answers
-// 429 and a Zen key can serve, the anonymous exit walk is capped at one
-// attempt so the key fallback gets its turn inside the caller's first-token
-// budget. These tests cover the decision helper, the pool predicate it reads,
-// and the end-to-end walk cap against a fake upstream.
+// The empirical-wall fast failover: while the anonymous lane answers 429
+// (v1.5.6) the anonymous exit walk is capped at one probe attempt; since
+// v1.8.2 the cap fires even with no usable key (a probe, not a handover), and
+// a burst-start walk stops as soon as its own 429s arm the wall. These tests
+// cover the decision helper, the pool predicate it reads, and the end-to-end
+// walk cap against a fake upstream.
 
 func TestHasUsableNode(t *testing.T) {
 	transports, err := transportPool([]string{"direct", "direct"}, config.PerformanceConfig{}, 0)
@@ -61,8 +62,12 @@ func TestAnonWallFastFailover(t *testing.T) {
 		t.Fatal("an armed wall with a usable key must trigger the fast failover")
 	}
 	g.zenNodes.MarkFailure(g.zenNodes.nodes[0], quotaResponse("3600"), nil)
-	if g.anonWallFastFailover() {
-		t.Fatal("no usable key: the walk must keep its full cap")
+	// v1.8.2: the cap is a wall probe, not a key handover — it fires whenever
+	// the lane is empirically walled, even with no usable key. The uncapped
+	// walk through a fully walled pool burned 5–7 exits and the caller's whole
+	// budget in production (the 2026-11-18 499s).
+	if !g.anonWallFastFailover() {
+		t.Fatal("an armed wall must cap the walk even with no usable key")
 	}
 }
 
@@ -187,26 +192,27 @@ func TestE2EAnonWallFastFailover(t *testing.T) {
 		return resp.StatusCode, string(raw)
 	}
 
-	// First request: the wall is not armed yet, so all three exits are walked
-	// and the key serves. The 429s arm the signal.
+	// First request: the wall is not armed yet, so the walk starts uncapped —
+	// but its own first two 429s arm the empirical wall mid-walk (v1.8.2),
+	// which stops the walk there. The key serves.
 	status, body := post()
 	if status != http.StatusOK || !strings.Contains(body, "OK") {
 		t.Fatalf("first request must be served by the key: status=%d body=%q", status, body)
 	}
-	if got := anonCalls.Load(); got != 3 {
-		t.Fatalf("uncapped walk must use all three exits, got %d anon calls", got)
+	if got := anonCalls.Load(); got != 2 {
+		t.Fatalf("the mid-walk arm must stop the walk at two exits, got %d anon calls", got)
 	}
 	if got := keyCalls.Load(); got != 1 {
 		t.Fatalf("the key must serve the first request, got %d key calls", got)
 	}
-	// Second request: wall armed + key usable → the walk is capped at one
+	// Second request: wall armed at entry → the walk is capped at one
 	// anon attempt and the key serves again.
 	status, body = post()
 	if status != http.StatusOK || !strings.Contains(body, "OK") {
 		t.Fatalf("second request must be served by the key: status=%d body=%q", status, body)
 	}
-	if got := anonCalls.Load(); got != 4 {
-		t.Fatalf("the capped walk must use exactly one more anon attempt (3 -> 4), got %d", got)
+	if got := anonCalls.Load(); got != 3 {
+		t.Fatalf("the capped walk must use exactly one more anon attempt (2 -> 3), got %d", got)
 	}
 	if got := keyCalls.Load(); got != 2 {
 		t.Fatalf("the key must serve the capped request, got %d key calls", got)

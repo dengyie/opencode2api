@@ -257,9 +257,10 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	if limit < 1 {
 		limit = 1
 	}
-	// Empirical-wall fast failover (v1.5.6): same contract as the proxy-backed
-	// walk — while the lane is walled and a Zen key can serve, one attempt is
-	// enough to catch the wall lifting. The probe is bounded by
+	// Empirical-wall fast failover (v1.5.6, recapped v1.8.2): same contract as
+	// the proxy-backed walk — while the lane is walled, one attempt is enough
+	// to catch the wall lifting, whether a Zen key can serve or the handler
+	// synthesizes the fast 429. The probe is bounded by
 	// wall_probe_timeout_seconds (v1.5.7) so a slow walled exit cannot spend
 	// the key's share of the caller's first-token budget.
 	attemptTimeout := g.attemptTimeout

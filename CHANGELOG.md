@@ -4,6 +4,39 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.2 (2026-11-18) — whole-pool wall judgment counts credential-dead keys; the walled anonymous walk always caps
+
+Post-deploy review of v1.8.1 (1.5h of tebi traffic) left three 499s sharing
+one shape: the whole pool walled (7 keys 429-cooled + kVFMr 401-dead) or
+probe-recovered keys on probation, and the anonymous lane walking 5–7 exits
+for the caller's full 30s budget before the client cancelled. Three
+interlocking causes, three fixes:
+
+### Fixed
+
+- **Credential-quarantined keys now count toward whole-pool walls**
+  (`internal/gateway/pool.go` `AllQuotaCooled`): a 401-dead key holds
+  `quotaUntil=0`, which kept `quotaWall()` false on mixed pools — the entry
+  pre-check and the v1.8.1 mid-walk fast fail never fired even when every
+  usable key was walled. A key's unavailability horizon is now
+  `max(quotaUntil, credUntil)`, and the verdict still requires at least one
+  genuine quota wall so an all-credential pool keeps the `credentialWall`
+  503 classification.
+- **The walled anonymous walk caps regardless of key availability**
+  (`internal/gateway/quotaprobe.go` `anonWallFastFailover`): v1.5.6 applied
+  the one-probe cap only while a Zen key was usable, so the no-usable-key
+  case walked every exit — "the exits are the only lane" — into a wall that
+  production shows is pool-wide (6–7/6–7 exits 429 within one request). The
+  cap is now a wall probe, not a key handover: one bounded attempt still
+  catches the wall lifting and answers a 200 directly.
+- **A burst-start walk stops when its own 429s arm the wall**
+  (`internal/gateway/upstream.go`): the wall signal needs two observations
+  within the window, but the fast-failover cap kept walks at one leg — the
+  counter starved at one per request and every burst's first request
+  re-walked everything. The walk now checks the signal after each exit and
+  stops at the arm (`anon_wall_armed_midwalk`), so any request costs at most
+  two anonymous legs before the wall is honored.
+
 ## v1.8.1 (2026-11-18) — mid-request quota-wall fast fail + probe-recovery probation
 
 Two traffic-shape optimizations for the free-tier 429 wall, from the 11-17

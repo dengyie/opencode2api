@@ -1190,24 +1190,39 @@ func (p *upstreamNodes) EvictionPending() int {
 	return pending
 }
 
-// AllQuotaCooled reports whether every key of this pool is quota-cooled and
-// when the first one reopens. A pool without keys, or with at least one
-// usable key, reports false. The quota pre-check uses this to reject a
-// request with zero upstream calls.
+// AllQuotaCooled reports whether every key of this pool is unavailable to
+// inference traffic, and when the first one reopens. A key is unavailable
+// while quota-cooled (quotaUntil) or credential-quarantined (credUntil):
+// v1.8.2 adds the credential leg because a 401-dead key holds quotaUntil=0,
+// which used to keep whole-pool judgments false on mixed pools — the entry
+// pre-check and the mid-walk fast fail then never fired even when every
+// usable key was walled (the 2026-11-18 tebi 499s). The verdict still needs
+// at least one genuine quota wall: an all-credential pool reports false so
+// the caller's credentialWall keeps the 503 classification.
 func (p *upstreamNodes) AllQuotaCooled() (time.Time, bool) {
 	if p == nil || len(p.nodes) == 0 {
 		return time.Time{}, false
 	}
 	now := time.Now().UnixNano()
 	earliest := time.Time{}
+	quotaWalled := false
 	for _, node := range p.nodes {
 		until := node.quotaUntil.Load()
+		if until > now {
+			quotaWalled = true
+		}
+		if cred := node.credUntil.Load(); cred > until {
+			until = cred
+		}
 		if until <= now {
 			return time.Time{}, false
 		}
 		if earliest.IsZero() || until < earliest.UnixNano() {
 			earliest = time.Unix(0, until)
 		}
+	}
+	if !quotaWalled {
+		return time.Time{}, false
 	}
 	return earliest, true
 }
