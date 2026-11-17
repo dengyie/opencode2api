@@ -441,11 +441,14 @@ func (t *TetherPoolConfig) Normalize() error {
 	if t.RebindMinIntervalSeconds == 0 {
 		t.RebindMinIntervalSeconds = 600
 	}
-	// The wall feedback loop is dispatched by the tetherpool worker, which
-	// only runs while the integration is enabled; accepting the combination
-	// would silently drop every report into an unread channel.
+	// The rebind feedback loops are dispatched by the tetherpool worker,
+	// which only runs while the integration is enabled; accepting the
+	// combinations would silently drop every report into an unread channel.
 	if t.RebindOnWall && !t.Enabled {
 		return errors.New("tetherpool.rebind_on_wall requires tetherpool.enabled")
+	}
+	if t.RebindOnFailure && !t.Enabled {
+		return errors.New("tetherpool.rebind_on_failure requires tetherpool.enabled")
 	}
 	if !t.Enabled {
 		return nil

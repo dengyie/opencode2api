@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -495,5 +496,81 @@ func TestWorkerHandlesExitFailureRebind(t *testing.T) {
 	after, _ := m.tpSnapshot.Load().(tetherpool.Snapshot)
 	if after.Accounts[0].NodeName != "aws-tokyo-warp-33" || after.Accounts[0].ExitIP != "2a09:bac1:3b20:99::16:33" {
 		t.Fatalf("snapshot must render the fresh binding, got %+v", after.Accounts[0])
+	}
+}
+
+// A failing acquire leaves the snapshot untouched and counts toward the
+// region-pin drop: after exitRebindRegionDropAfter consecutive failures the
+// next acquire asks for any region (v1.8.6), and a success resets the streak.
+func TestWorkerExitFailureRebindFailurePath(t *testing.T) {
+	var queries []string
+	var fail atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/allocation/acquire", func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.RawQuery)
+		if fail.Load() {
+			http.Error(w, "no node available", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"account_id":"oc2api_j276O","node_name":"aws-tokyo-warp-33","gateway_proxy_url":"http://127.0.0.1:9101/j276O","exit_ip":"2a09:bac1:3b20:99::16:33","region":"tokyo"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg, _ := tetherConfig(t, server.URL)
+	cfg.TetherPool.RebindOnFailure = true
+	m := &RuntimeController{logger: quietLogger(), tpRetryInterval: time.Minute}
+	snapshot := tetherpool.Snapshot{Mode: tetherpool.ModeAPI, Accounts: []tetherpool.KeyBinding{{
+		AccountID: "oc2api_j276O", NodeName: "huawei-sg-warp-47", Region: "singapore",
+		ExitIP: "2a09:bac1:6520:8::3c2:10", ProxyURL: "http://127.0.0.1:9101/j276O",
+	}}}
+	m.tpSnapshot.Store(snapshot)
+	client := tetherpool.NewClient(server.URL, "", 5*time.Second)
+	ev := tetherpool.RebindRequest{Kind: tetherpool.RebindKindFailure, AccountID: "oc2api_j276O", KeyID: "j276O", Reason: "health_check_failed"}
+
+	fail.Store(true)
+	for i := 0; i < exitRebindRegionDropAfter+1; i++ {
+		m.handleExitFailureRebind(context.Background(), client, cfg, cfg.TetherPool.Service, ev)
+	}
+	if len(queries) != exitRebindRegionDropAfter+1 {
+		t.Fatalf("each failure must attempt one acquire, got %d", len(queries))
+	}
+	for i, q := range queries[:exitRebindRegionDropAfter] {
+		if !strings.Contains(q, "region=singapore") {
+			t.Fatalf("attempt %d must keep the region pin, got %s", i, q)
+		}
+	}
+	if strings.Contains(queries[exitRebindRegionDropAfter], "region=") {
+		t.Fatalf("the attempt past the streak must drop the region pin, got %s", queries[exitRebindRegionDropAfter])
+	}
+	if m.rebindFailStreak["oc2api_j276O"] != exitRebindRegionDropAfter+1 {
+		t.Fatalf("the streak must count every failure, got %d", m.rebindFailStreak["oc2api_j276O"])
+	}
+	after, _ := m.tpSnapshot.Load().(tetherpool.Snapshot)
+	if after.Accounts[0].NodeName != "huawei-sg-warp-47" || after.Accounts[0].ExitIP != "2a09:bac1:6520:8::3c2:10" {
+		t.Fatalf("failed rebinds must not touch the snapshot, got %+v", after.Accounts[0])
+	}
+
+	// A success clears the streak and re-pins the account to where it landed.
+	fail.Store(false)
+	queries = nil
+	m.handleExitFailureRebind(context.Background(), client, cfg, cfg.TetherPool.Service, ev)
+	if len(queries) != 1 {
+		t.Fatalf("the recovery acquire must fire once, got %d", len(queries))
+	}
+	if _, ok := m.rebindFailStreak["oc2api_j276O"]; ok {
+		t.Fatalf("a success must reset the streak, got %d", m.rebindFailStreak["oc2api_j276O"])
+	}
+	after, _ = m.tpSnapshot.Load().(tetherpool.Snapshot)
+	if after.Accounts[0].NodeName != "aws-tokyo-warp-33" || after.Accounts[0].Region != "tokyo" {
+		t.Fatalf("the snapshot must render the recovery binding, got %+v", after.Accounts[0])
+	}
+	// And the next failure pins to the freshly landed region again.
+	queries = nil
+	fail.Store(true)
+	m.handleExitFailureRebind(context.Background(), client, cfg, cfg.TetherPool.Service, ev)
+	if len(queries) != 1 || !strings.Contains(queries[0], "region=tokyo") {
+		t.Fatalf("a success must re-pin the region for the next episode, got %v", queries)
 	}
 }

@@ -74,10 +74,18 @@ type RuntimeController struct {
 	// tpRebind carries wall-triggered battery reports to the dispatch worker
 	// and tpSnapshot mirrors the provision state the current gateway renders
 	// in /healthz; tpCancel stops the worker at Shutdown and on re-arm.
+	// snapshotMu serializes the snapshot's writers — build()'s Store and the
+	// worker's read-modify-write for exit-failure rebinds (v1.8.6) — so a
+	// rebuild landing mid-rebind never loses either side's update.
 	tp         *tetherpool.Provisioner
 	tpRebind   chan tetherpool.RebindRequest
 	tpSnapshot atomic.Value // tetherpool.Snapshot
-	tpCancel   context.CancelFunc
+	snapshotMu sync.Mutex
+	// rebindFailStreak counts consecutive failed exit-rebind acquires per
+	// account, gating the region-pin drop after exitRebindRegionDropAfter
+	// failures. Touched only by the worker under snapshotMu.
+	rebindFailStreak map[string]int
+	tpCancel         context.CancelFunc
 	// tpRetryInterval paces the worker's re-provision retries while the
 	// snapshot is static_fallback. Zero uses the 5-minute default; tests
 	// shorten it. Written only before the worker starts.
@@ -113,6 +121,7 @@ func RuntimeManager(root context.Context, configPath string, cfg config.Config, 
 		configPath: configPath, root: root, logger: logger, monitor: monitor, hub: hub, redactor: redactor, level: level,
 		effective: EffectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled,
 			PprofEnabled: cfg.Performance.PprofEnabled, MemoryLimitBytes: cfg.Performance.MemoryLimitBytes},
+		rebindFailStreak: make(map[string]int),
 	}
 	manager.metadata = modelcatalog.PricingStore(configPath, logger)
 	// OpenCode metadata refreshes ride the active runtime's healthy proxy
@@ -262,9 +271,13 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 		return nil, err
 	}
 	// Only a build that will actually be swapped in updates the worker's view;
-	// a failed apply keeps serving the previous runtime's truth.
+	// a failed apply keeps serving the previous runtime's truth. The Store is
+	// serialized with the worker's exit-rebind read-modify-write under
+	// snapshotMu so neither side loses its update (v1.8.6).
 	if cfg.TetherPool.Enabled {
+		m.snapshotMu.Lock()
 		m.tpSnapshot.Store(tpSnapshot)
+		m.snapshotMu.Unlock()
 	}
 	// Tag the TetherPool-bound proxies with their accounts so exit-failure
 	// rebinds know which binding to re-acquire (v1.8.5). A rebuild re-tags

@@ -4,6 +4,45 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.6 (2026-11-18) — review fixes: exit-rebind robustness hardening
+
+Root-cause pass over the v1.8.5 review findings.
+
+### Fixed
+
+- **Snapshot read-modify-write can no longer lose against a rebuild**
+  (`internal/gateway/tetherpool.go`, `internal/gateway/runtime.go`): the
+  worker's exit-rebind update and `build()`'s Store now serialize under
+  `snapshotMu`, so a rebuild landing mid-rebind keeps its fresh snapshot and
+  the rebind's update lands on top of it. Previously the worker could
+  overwrite a just-landed snapshot with its stale view.
+- **A nil logger no longer corrupts the snapshot on a failed rebind**
+  (`tetherpool.go`): the old `if m.logger != nil && err != nil` guard let a
+  failed acquire fall through to the snapshot update with a zero-value
+  allocation. The failure path now returns before touching the snapshot,
+  regardless of the logger.
+- **A dying region can no longer wedge the rebind** (`tetherpool.go`): after
+  `exitRebindRegionDropAfter` (3) consecutive failed acquires for one
+  account, the next attempt drops the region pin and asks for any region;
+  a success re-pins to where it actually landed and resets the streak.
+  Event `tp_exit_rebind_region_dropped` records the escalation.
+- **`tetherpool.rebind_on_failure` requires `tetherpool.enabled`**
+  (`internal/config/config.go`): the same validation `rebind_on_wall` has —
+  the combination used to be silently accepted while the worker dropped
+  every report into an unread channel.
+
+### Changed
+
+- `RebindKindFailure` / `RebindKindWall` constants replace the `"failure"`
+  magic string; the rebind request's `KeyID` carries the display id (prefix
+  stripped) instead of the full account id, matching its logging contract.
+
+### Added
+
+- `TestWorkerExitFailureRebindFailurePath`: failed acquires leave the
+  snapshot untouched and count toward the region-pin drop; a success resets
+  the streak and re-pins to the freshly landed region.
+
 ## v1.8.5 (2026-11-18) — TetherPool exit failure auto-rebind: a dead egress swaps itself out
 
 With all ten zen keys bound to per-key TetherPool egress accounts (Mode B),

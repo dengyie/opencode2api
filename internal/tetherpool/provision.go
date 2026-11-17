@@ -26,14 +26,23 @@ func AccountID(key string) string {
 
 // RebindRequest is one wall-triggered battery report or exit-failure rebind
 // queued for the dispatch worker. KeyID carries the display id for logging
-// only; Kind selects the control-plane action: "" (wall) posts a battery
-// event, "failure" soft-rebinds the account to a fresh exit with an acquire.
+// only; Kind selects the control-plane action per the RebindKind constants.
 type RebindRequest struct {
 	AccountID string
 	KeyID     string
 	Reason    string
 	Kind      string
 }
+
+// Kind values for RebindRequest. RebindKindWall is the zero value so the
+// pre-v1.8.5 battery reports keep their shape.
+const (
+	// RebindKindWall posts a battery event that force-rebinds a walled key.
+	RebindKindWall = ""
+	// RebindKindFailure soft-rebinds an account whose exit failed its health
+	// verification to a fresh egress with an acquire (no battery penalty).
+	RebindKindFailure = "failure"
+)
 
 // Provision snapshot modes rendered in /healthz.
 const (
