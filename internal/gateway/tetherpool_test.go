@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -385,5 +386,114 @@ func TestConfigRoundTripDropsProvisionedProxies(t *testing.T) {
 	}
 	if got := len(second.gateway.transports.items); got != 3 {
 		t.Fatalf("rebuild must not accumulate stale entries, got %d transports", got)
+	}
+}
+
+// A failed health verification on a TetherPool-bound proxy queues one
+// exit-failure rebind (v1.8.5); the CAS interval dedups repeats, the knob
+// gates the whole path, and static spares never fire.
+func TestObserveProxyExitFailure(t *testing.T) {
+	cfg, _ := tetherConfig(t, "http://127.0.0.1:1")
+	cfg.TetherPool.RebindOnFailure = true
+	cfg.TetherPool.RebindMinIntervalSeconds = 60
+	g := &Gateway{cfg: cfg, logger: quietLogger(), transports: &proxyTransports{}}
+	ch := make(chan tetherpool.RebindRequest, 4)
+	g.tpRebind = ch
+	dead := &proxyTransport{index: 0, name: "http://127.0.0.1:9101/j276O", tpAccountID: "oc2api_j276O"}
+	dead.healthy.Store(true)
+	g.transports.items = []*proxyTransport{dead}
+
+	// One failed verification on a bound proxy fires immediately — the probe
+	// itself is the confirmation layer — but only once per interval.
+	g.applyProxyHealthResult(proxyHealthResult{proxy: dead, err: errors.New("dial: refused"), failed: true, wasHealthy: true}, "test", 0)
+	select {
+	case ev := <-ch:
+		if ev.Kind != "failure" || ev.AccountID != "oc2api_j276O" {
+			t.Fatalf("unexpected rebind: %+v", ev)
+		}
+	default:
+		t.Fatal("a failed verification on a bound proxy must queue an exit rebind")
+	}
+	// Inside the min interval: silent.
+	g.applyProxyHealthResult(proxyHealthResult{proxy: dead, err: errors.New("dial: refused"), failed: true, wasHealthy: false}, "test", 0)
+	select {
+	case ev := <-ch:
+		t.Fatalf("the CAS interval must dedup repeats, got %+v", ev)
+	default:
+	}
+	// Past the interval: fires again.
+	dead.rebindFiredAt.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	g.applyProxyHealthResult(proxyHealthResult{proxy: dead, err: errors.New("dial: refused"), failed: true, wasHealthy: false}, "test", 0)
+	select {
+	case <-ch:
+	default:
+		t.Fatal("a verification failure past the interval must rebind again")
+	}
+
+	// Knob off: nothing fires.
+	g.cfg.TetherPool.RebindOnFailure = false
+	dead.rebindFiredAt.Store(0)
+	g.applyProxyHealthResult(proxyHealthResult{proxy: dead, err: errors.New("dial: refused"), failed: true, wasHealthy: false}, "test", 0)
+	select {
+	case ev := <-ch:
+		t.Fatalf("the knob must gate the path, got %+v", ev)
+	default:
+	}
+
+	// Static spares (no account) never fire.
+	g.cfg.TetherPool.RebindOnFailure = true
+	spare := &proxyTransport{index: 99, name: "static-spare"}
+	spare.healthy.Store(true)
+	g.applyProxyHealthResult(proxyHealthResult{proxy: spare, err: errors.New("dial: refused"), failed: true, wasHealthy: true}, "test", 0)
+	select {
+	case ev := <-ch:
+		t.Fatalf("a static spare must never rebind, got %+v", ev)
+	default:
+	}
+}
+
+// The worker's failure-kind branch soft-rebinds via the control plane's
+// acquire (force_rebalance) and updates the rendered snapshot in place, so
+// /healthz shows the fresh exit without a rebuild.
+func TestWorkerHandlesExitFailureRebind(t *testing.T) {
+	var acquired string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/allocation/acquire", func(w http.ResponseWriter, r *http.Request) {
+		acquired = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"account_id":"oc2api_j276O","node_name":"aws-tokyo-warp-33","gateway_proxy_url":"http://127.0.0.1:9101/j276O","exit_ip":"2a09:bac1:3b20:99::16:33","region":"singapore"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	cfg, _ := tetherConfig(t, server.URL)
+	cfg.TetherPool.RebindOnFailure = true
+	m := &RuntimeController{logger: quietLogger(), tpRetryInterval: time.Minute}
+	m.tpRebind = make(chan tetherpool.RebindRequest, 4)
+	snapshot := tetherpool.Snapshot{Mode: tetherpool.ModeAPI, Accounts: []tetherpool.KeyBinding{{
+		AccountID: "oc2api_j276O", NodeName: "huawei-sg-warp-47", Region: "singapore",
+		ExitIP: "2a09:bac1:6520:8::3c2:10", ProxyURL: "http://127.0.0.1:9101/j276O",
+	}}}
+	m.tpSnapshot.Store(snapshot)
+
+	client := tetherpool.NewClient(server.URL, "", 5*time.Second)
+	done := make(chan struct{})
+	go func() {
+		m.handleExitFailureRebind(context.Background(), client, cfg, cfg.TetherPool.Service, tetherpool.RebindRequest{
+			Kind: "failure", AccountID: "oc2api_j276O", KeyID: "j276O", Reason: "health_check_failed",
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return")
+	}
+	if !strings.Contains(acquired, "force_rebalance=true") || !strings.Contains(acquired, "account_id=oc2api_j276O") {
+		t.Fatalf("unexpected acquire query: %s", acquired)
+	}
+	after, _ := m.tpSnapshot.Load().(tetherpool.Snapshot)
+	if after.Accounts[0].NodeName != "aws-tokyo-warp-33" || after.Accounts[0].ExitIP != "2a09:bac1:3b20:99::16:33" {
+		t.Fatalf("snapshot must render the fresh binding, got %+v", after.Accounts[0])
 	}
 }

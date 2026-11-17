@@ -38,6 +38,13 @@ type proxyTransport struct {
 	healthy      atomic.Bool
 	checking     atomic.Bool
 	blockedUntil atomic.Int64
+	// tpAccountID marks a TetherPool-bound proxy (set at build from the
+	// provision snapshot); empty for the statically configured spares. It is
+	// the account an exit-failure rebind re-acquires.
+	tpAccountID string
+	// rebindFiredAt spaces this proxy's exit-failure rebind reports at least
+	// tetherpool.rebind_min_interval_seconds apart.
+	rebindFiredAt atomic.Int64
 }
 
 // proxyTransports holds every configured proxy route, indexed by

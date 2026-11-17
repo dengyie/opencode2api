@@ -24,12 +24,15 @@ func AccountID(key string) string {
 	return AccountPrefix + config.KeyDisplayID(key)
 }
 
-// RebindRequest is one wall-triggered battery report queued for the dispatch
-// worker. KeyID carries the display id for logging only.
+// RebindRequest is one wall-triggered battery report or exit-failure rebind
+// queued for the dispatch worker. KeyID carries the display id for logging
+// only; Kind selects the control-plane action: "" (wall) posts a battery
+// event, "failure" soft-rebinds the account to a fresh exit with an acquire.
 type RebindRequest struct {
 	AccountID string
 	KeyID     string
 	Reason    string
+	Kind      string
 }
 
 // Provision snapshot modes rendered in /healthz.

@@ -147,6 +147,10 @@ func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string
 		g.logger.Debug("proxy health check was inconclusive", "component", "proxy", "event", "health_check_inconclusive", "source", source, "upstream_status", upstreamStatus, "proxy", config.RedactURL(result.proxy.name), "error", result.err)
 		return
 	}
+	// The route itself is dead (v1.8.5): a TetherPool-bound proxy gets its
+	// account soft-rebinded to a fresh exit, so the same proxy URL heals
+	// instead of the key squatting on a spare.
+	g.observeProxyExitFailure(result.proxy, "health_check_failed")
 	if g.transports.hasHealthy() {
 		zenMoved, goMoved := g.rebindUnavailableProxy(result.proxy, result.wasHealthy)
 		if result.wasHealthy || zenMoved+goMoved > 0 {

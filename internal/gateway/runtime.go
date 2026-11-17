@@ -266,6 +266,18 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 	if cfg.TetherPool.Enabled {
 		m.tpSnapshot.Store(tpSnapshot)
 	}
+	// Tag the TetherPool-bound proxies with their accounts so exit-failure
+	// rebinds know which binding to re-acquire (v1.8.5). A rebuild re-tags
+	// from the fresh snapshot; static spares never get an account.
+	if len(tpSnapshot.Accounts) > 0 {
+		byURL := make(map[string]string, len(tpSnapshot.Accounts))
+		for _, a := range tpSnapshot.Accounts {
+			byURL[a.ProxyURL] = a.AccountID
+		}
+		for _, proxy := range gateway.transports.items {
+			proxy.tpAccountID = byURL[proxy.name]
+		}
+	}
 	gateway.rotation = m.rotation
 	gateway.tpRebind = m.tpRebind
 	// v1.8.0: the eviction callback removes a credential-dead key from the

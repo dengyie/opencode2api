@@ -4,6 +4,37 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.5 (2026-11-18) — TetherPool exit failure auto-rebind: a dead egress swaps itself out
+
+With all ten zen keys bound to per-key TetherPool egress accounts (Mode B),
+one dead exit node used to sit unhealthy until the TetherPool's own battery
+drain or the next battery event happened to rebalance it. The gateway now
+asks the controller for a fresh exit the moment its own health checker
+declares the egress failed — a soft rebalance (`force_rebalance` +
+`avoid_banned`), not a battery penalty: an egress dying is a line problem,
+not an account problem. It composes with the existing `rebind_on_wall`
+path (battery events), which stays the only writer for that kind.
+
+### Added
+
+- **Exit-failure rebind** (`internal/gateway/refresh.go`,
+  `internal/gateway/tetherpool.go`): when `applyProxyHealthResult` marks a
+  TetherPool-backed proxy failed, the gateway emits a `failure`-kind rebind
+  request; the TetherPool worker calls the controller's acquire endpoint
+  with `force_rebalance=true&avoid_banned=true`, then rewrites the account
+  entry in the cached snapshot in place (new node name, exit IP, region), so
+  subsequent builds pick up the new egress without a resync. Events
+  `tp_exit_rebound` / `tp_exit_rebind_failed` record the swap.
+- **`tetherpool.rebind_on_failure`** (default false): the knob, added to
+  `config.example.json`. Off by default; opt-in per deployment.
+- CAS throttle per proxy (`rebindFiredAt` + `tetherpool.rebind_min_interval`,
+  reusing the existing wall-rebind interval): repeated health-check failures
+  of the same proxy do not hammer the controller.
+- `TestObserveProxyExitFailure` (trigger, throttle, knob-off, static-proxy
+  no-op), `TestWorkerHandlesExitFailureRebind` (acquire query shape +
+  in-place snapshot update), `TestAcquireRebindQuery` (client-side query
+  building, empty egress omitted).
+
 ## v1.8.4 (2026-11-18) — TLS fingerprint re-capture: match the official client's embedded Bun, unify model listings
 
 A three-way ClientHello capture (gateway `BunTransport` vs the official

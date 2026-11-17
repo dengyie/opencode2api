@@ -402,6 +402,14 @@ type TetherPoolConfig struct {
 	// window still has to run out. Off by default until the efficacy is
 	// measured in production.
 	RebindOnWall bool `json:"rebind_on_wall"`
+	// RebindOnFailure turns exit-failure rebinding on: when a TetherPool-bound
+	// proxy fails its health verification (the route is dead, not the upstream),
+	// the gateway soft-rebinds the account to a fresh exit with an acquire
+	// (force_rebalance + avoid_banned) so the same proxy URL serves from a new
+	// egress and the key returns to its own binding instead of squatting on a
+	// spare. Connection failures are the exit's fault, not the account's, so
+	// this path never posts battery penalties.
+	RebindOnFailure bool `json:"rebind_on_failure"`
 	// RebindMinIntervalSeconds is how long one key waits between wall-triggered
 	// rebind reports, so a wall episode costs at most one event per interval
 	// no matter how many in-flight requests observe the 429.

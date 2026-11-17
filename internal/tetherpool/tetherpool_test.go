@@ -401,3 +401,39 @@ func TestResolveReusesBindingsAcrossRegionShift(t *testing.T) {
 		t.Fatalf("surviving keys must keep their own bindings, got %q", entries)
 	}
 }
+
+// AcquireRebind re-acquires with the soft-rebind query: force_rebalance moves
+// the binding, avoid_banned keeps it off penalized exits, and an empty
+// egress preference is omitted so the control plane keeps the line type.
+func TestAcquireRebindQuery(t *testing.T) {
+	var gotQuery, gotPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/allocation/acquire", func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"account_id":"oc2api_j276O","node_name":"aws-tokyo-warp-28","gateway_proxy_url":"http://127.0.0.1:9101/x","exit_ip":"2a09:bac1:3b20:10::16:171","region":"tokyo"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	client := NewClient(server.URL, "", time.Second)
+	alloc, err := client.AcquireRebind(context.Background(), "opencode2api", "oc2api_j276O", "", "singapore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/allocation/acquire" {
+		t.Fatalf("path = %s", gotPath)
+	}
+	q := gotQuery
+	for _, want := range []string{"force_rebalance=true", "avoid_banned=true", "account_id=oc2api_j276O", "region=singapore"} {
+		if !strings.Contains(q, want) {
+			t.Fatalf("query missing %s: %s", want, q)
+		}
+	}
+	if strings.Contains(q, "egress_preference") {
+		t.Fatalf("an empty egress preference must be omitted: %s", q)
+	}
+	if alloc.NodeName != "aws-tokyo-warp-28" || alloc.ExitIP != "2a09:bac1:3b20:10::16:171" {
+		t.Fatalf("unexpected allocation: %+v", alloc)
+	}
+}

@@ -80,6 +80,31 @@ func (c *Client) Acquire(ctx context.Context, service, accountID, egress, region
 	return alloc, nil
 }
 
+// AcquireRebind re-acquires accountID's binding with force_rebalance so the
+// control plane moves it to a different node, and avoid_banned so a soft
+// rebind never lands on an exit the pool already penalized. It is the
+// connection-failure counterpart of the battery event: the account did
+// nothing wrong — its exit died — so the binding moves without any battery
+// penalty, and the same gateway proxy URL keeps serving from the new exit.
+func (c *Client) AcquireRebind(ctx context.Context, service, accountID, egress, region string) (Allocation, error) {
+	query := url.Values{}
+	query.Set("service", service)
+	query.Set("account_id", accountID)
+	if egress != "" {
+		query.Set("egress_preference", egress)
+	}
+	if region != "" {
+		query.Set("region", region)
+	}
+	query.Set("force_rebalance", "true")
+	query.Set("avoid_banned", "true")
+	var alloc Allocation
+	if err := c.do(ctx, http.MethodPost, "/v1/allocation/acquire?"+query.Encode(), "", &alloc); err != nil {
+		return Allocation{}, err
+	}
+	return alloc, nil
+}
+
 // BatteryEvent posts a business outcome for accountID. With forceRebind the
 // control plane immediately migrates the account to a different node.
 func (c *Client) BatteryEvent(ctx context.Context, ev BatteryEvent) error {
