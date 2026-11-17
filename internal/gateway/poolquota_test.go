@@ -528,3 +528,47 @@ func TestQuotaProbeModelPrefersObservedNonReasoning(t *testing.T) {
 		t.Fatalf("crouton excluded by observation = %q ok=%v, want deepseek", model, ok)
 	}
 }
+
+// v1.8.7: the selection cursor must treat a quota wall as a hard cooldown —
+// a walled key's Retry-After runs for hours, so skipping it in favor of any
+// uncooled peer is the whole point. The all-walled pool still returns the
+// earliest-reopening key (the pre-check and fast-fail semantics rely on that
+// fallback shape), and a healthy proxy's walled key loses to an uncooled key
+// on an unhealthy proxy only after every healthy-proxy key is exhausted.
+func TestNextSkipsQuotaWalledKey(t *testing.T) {
+	pool := testKeyPool(3, 10*time.Minute)
+	walled, fresh := pool.nodes[0], pool.nodes[1]
+	pool.MarkFailure(walled, quotaResponse("3600"), nil) // a one-hour wall
+
+	// Cursor starts at the walled key: the walk must hop over it.
+	cursor := nodeCursor{pool: pool, next: walled.index}
+	if got := cursor.Next(); got != fresh {
+		t.Fatalf("cursor must skip the walled key, got %q", got.key)
+	}
+	// The cursor advanced past the choice, so the next pick is the third key.
+	if got := cursor.Next(); got == walled {
+		t.Fatal("cursor must not revisit the walled key while peers are ready")
+	}
+
+	// A walled key on a healthy proxy is not preferred over an uncooled key
+	// on an unhealthy proxy: the walled key still counts as cooling.
+	// (Proxy health lives on the transports; with no transports every proxy
+	// reads unhealthy, so this pool serves through the ready fallback — the
+	// assertable invariant is that the walled key is never first.)
+	cursor = nodeCursor{pool: pool, next: walled.index}
+	for i := 0; i < 2; i++ {
+		if got := cursor.Next(); got == walled {
+			t.Fatalf("attempt %d: the walled key must not be picked while peers are ready", i)
+		}
+	}
+
+	// All keys walled: the earliest-reopening key comes back (fast-fail
+	// depends on this), not nil.
+	pool.MarkFailure(fresh, quotaResponse("1800"), nil)
+	pool.MarkFailure(pool.nodes[2], quotaResponse("7200"), nil)
+	cursor = nodeCursor{pool: pool, next: 0}
+	got := cursor.Next()
+	if got != fresh {
+		t.Fatalf("an all-walled pool must return the earliest reopening key, got %q", got.key)
+	}
+}

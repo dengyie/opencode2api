@@ -865,11 +865,17 @@ func (p *upstreamNodes) CursorFor(affinity string) nodeCursor {
 }
 
 // Next chooses an uncooled key on a healthy proxy first, then the earliest
-// cooling key on any healthy proxy. Only when no healthy proxy has a key does
-// it fall back to an uncooled key on an unhealthy proxy, then the earliest
-// cooldown overall. It moves the cursor past the selected node. Unlike
-// anonymousCursor.Next it never returns nil for a non-empty pool and may revisit
-// a node, so callers bound attempts themselves.
+// cooling key on any healthy proxy. A quota-walled key (quotaUntil in the
+// future, v1.8.7) counts as cooling no matter what its short cooldownUntil
+// says — the upstream Retry-After of a wall runs hours, and handing traffic
+// back to a walled key before its window reopens only burns 429 legs (222 of
+// yesterday's 200s first burned one). Only when no healthy proxy has a key
+// does it fall back to an uncooled key on an unhealthy proxy, then the
+// earliest cooldown overall — so a fully walled pool still returns the
+// earliest-reopening key and the pre-check/fast-fail semantics stay intact.
+// It moves the cursor past the selected node. Unlike anonymousCursor.Next it
+// never returns nil for a non-empty pool and may revisit a node, so callers
+// bound attempts themselves.
 func (c *nodeCursor) Next() *upstreamNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
@@ -884,6 +890,9 @@ func (c *nodeCursor) Next() *upstreamNode {
 		proxy := c.pool.Proxy(node)
 		healthy := proxy != nil && proxy.healthy.Load()
 		until := node.cooldownUntil.Load()
+		if walled := node.quotaUntil.Load(); walled > until {
+			until = walled
+		}
 		if until <= now {
 			if healthy {
 				healthyReady = i

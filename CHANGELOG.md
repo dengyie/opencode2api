@@ -4,6 +4,30 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.7 (2026-11-18) — load balancing: the cursor stops handing traffic to quota-walled keys
+
+A production-log audit of the load-balancing path found the one real skew:
+`nodeCursor.Next` ranked keys by `cooldownUntil` alone, and a quota wall's
+upstream `Retry-After` runs for hours (yesterday's median 6.1h, max 24h).
+A walled key therefore read as the pool's "earliest cooling" fallback, and
+every new walk burned a 429 leg on it before reaching a live key — 222 of
+yesterday's successful keyed requests first burned exactly one walled leg,
+with session affinity pinning hot conversations to the same walled key
+every time.
+
+### Fixed
+
+- **Quota walls are hard cooldowns for selection**
+  (`internal/gateway/pool.go`): `Next` now takes `max(cooldownUntil,
+  quotaUntil)` as a key's cooldown instant — a walled key is skipped while
+  any uncooled peer exists, and the earliest-*reopening* key (now correctly
+  the one whose quota window opens first, not whose short cooldown does) is
+  returned only when the whole pool is walled, keeping the v1.8.1 fast-fail
+  and pre-check semantics intact.
+- `TestNextSkipsQuotaWalledKey` pins the three shapes: skip on the first
+  hop, no revisit while peers are ready, and an all-walled pool still
+  returns the earliest reopening key.
+
 ## v1.8.6 (2026-11-18) — review fixes: exit-rebind robustness hardening
 
 Root-cause pass over the v1.8.5 review findings.
