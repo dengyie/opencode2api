@@ -1135,6 +1135,24 @@ func (p *upstreamNodes) RepinCredentialQuarantine(node *upstreamNode) {
 	}
 }
 
+// MarkProbation (v1.8.1) puts a freshly probe-recovered key on a short soft
+// cooldown: the selection cursor (Next reads cooldownUntil only) demotes it
+// to the earliest-cooling fallback bucket, so hot traffic reaches keys that
+// were never walled first, and the recovered key stops absorbing the burst
+// that re-walled it within seconds (151 probe recoveries → immediate re-429
+// in production). Deliberately does NOT touch quotaUntil — that field feeds
+// AllQuotaCooled and the pre-checks, and a probation that looked like a wall
+// would keep whole-pool rejections firing. Nothing clears a probation early:
+// it lapses passively, and the quota probe loop has no business with it.
+func (p *upstreamNodes) MarkProbation(node *upstreamNode, d time.Duration) {
+	if p == nil || node == nil || d <= 0 {
+		return
+	}
+	if until := time.Now().Add(d).UnixNano(); until > node.cooldownUntil.Load() {
+		node.cooldownUntil.Store(until)
+	}
+}
+
 // EvictionDueNodes returns the keys whose eviction deadline (v1.8.0) has
 // lapsed while their credential streak is still at or beyond the death
 // threshold — i.e. the key stayed credential-dead through the whole

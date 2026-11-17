@@ -192,3 +192,45 @@ func TestEvictDueKeysCallbackFailureStopsSweep(t *testing.T) {
 		t.Fatalf("a failed callback must be retried next tick, got %d calls", called)
 	}
 }
+
+// Probation (v1.8.1) sets a soft cooldown only: cooldownUntil moves out,
+// quotaUntil stays zero so AllQuotaCooled and the pre-checks are untouched,
+// and the selection cursor demotes the key while uncooled peers exist.
+func TestMarkProbationSoftCooldownOnly(t *testing.T) {
+	pool := testKeyPool(2, 10*time.Minute)
+	node := pool.nodes[0]
+	pool.MarkProbation(node, time.Minute)
+	if node.cooldownUntil.Load() == 0 {
+		t.Fatal("probation must set cooldownUntil")
+	}
+	if node.quotaUntil.Load() != 0 {
+		t.Fatal("probation must not touch quotaUntil (pre-check semantics)")
+	}
+	if _, all := pool.AllQuotaCooled(); all {
+		t.Fatal("a probation must never read as a quota wall")
+	}
+	if node.probeNextAt.Load() != 0 {
+		t.Fatal("probation must not schedule probes")
+	}
+	// The cursor prefers the uncooled peer while the probation runs.
+	cursor := pool.CursorFor("session-probation")
+	if first := cursor.Next(); first != pool.nodes[1] {
+		t.Fatal("the cursor must prefer the uncooled key during probation")
+	}
+	// A shorter cooldown is not extended by a re-mark.
+	kept := pool.nodes[0].cooldownUntil.Load()
+	pool.MarkProbation(pool.nodes[0], time.Second)
+	if pool.nodes[0].cooldownUntil.Load() != kept {
+		t.Fatal("probation must never shorten an existing cooldown")
+	}
+}
+
+// Zero or negative durations are a no-op (feature off).
+func TestMarkProbationZeroDisabled(t *testing.T) {
+	pool := testKeyPool(1, 10*time.Minute)
+	pool.MarkProbation(pool.nodes[0], 0)
+	pool.MarkProbation(pool.nodes[0], -time.Minute)
+	if pool.nodes[0].cooldownUntil.Load() != 0 {
+		t.Fatal("zero/negative probation must be a no-op")
+	}
+}

@@ -257,9 +257,17 @@ func TestE2EQuotaProbeRecoversKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	g.probeQuotaKey(ctx, g.zenNodes, node)
-	if node.cooldownUntil.Load() != 0 || node.quotaUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
-		t.Fatalf("a successful probe must clear all cooldown state, got cooldown=%d quota=%d probeNext=%d",
-			node.cooldownUntil.Load(), node.quotaUntil.Load(), node.probeNextAt.Load())
+	if node.quotaUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
+		t.Fatalf("a successful probe must clear the quota and probe state, got quota=%d probeNext=%d",
+			node.quotaUntil.Load(), node.probeNextAt.Load())
+	}
+	// Since v1.8.1 a recovered key serves a probation cooldown (soft demotion,
+	// cooldownUntil only) so hot traffic does not instantly re-wall it. The
+	// stretch must stay inside the configured probation window.
+	if cd := node.cooldownUntil.Load(); cd != 0 {
+		if remaining := time.Until(time.Unix(0, cd)); remaining > time.Minute {
+			t.Fatalf("the probe recovery may only leave the probation cooldown, got %v remaining", remaining)
+		}
 	}
 	// And the key is usable again: a live non-stream request through it gets
 	// the upstream's 200 instead of the wall.
@@ -387,13 +395,16 @@ func TestE2EQuotaPrecheckAnonymousRoute(t *testing.T) {
 	}
 
 	// First two walks: anonymous lane and key lane both 429, arming the signal.
+	// Since v1.8.1 the second walk may be cut short by the mid-request wall
+	// fast fail (the synthesized body matches the pre-check), which is the
+	// point: it must not rotate onto the already-walled key again.
 	for i := 0; i < 2; i++ {
 		status, body := post()
 		if status != http.StatusTooManyRequests {
 			t.Fatalf("walk request %d: status = %d, want 429", i+1, status)
 		}
-		if strings.Contains(body, "quota-cooled") {
-			t.Fatalf("walk request %d must reach the upstream, got the pre-check: %q", i+1, body)
+		if i == 0 && strings.Contains(body, "quota-cooled") {
+			t.Fatalf("walk request 1 must reach the upstream, got the pre-check: %q", body)
 		}
 	}
 	walkCalls := upstreamCalls.Load()
@@ -537,14 +548,21 @@ func TestE2ECredentialQuarantineLoop(t *testing.T) {
 	}
 
 	// Probe recovery: the upstream starts answering 200; the probe loop clears
-	// the quarantine and the key routes live traffic again.
+	// the quarantine and the key routes live traffic again. The probation
+	// (v1.8.1) leaves a short soft cooldown — the credential quarantine itself
+	// must be gone, and the key must serve despite the demotion (a single-key
+	// pool falls back to the earliest-cooling candidate).
 	healthy.Store(true)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	g.probeQuotaKey(ctx, g.zenNodes, node)
-	if node.credUntil.Load() != 0 || node.cooldownUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
-		t.Fatalf("a successful probe must clear the quarantine, got cooldown=%d cred=%d probeNext=%d",
-			node.cooldownUntil.Load(), node.credUntil.Load(), node.probeNextAt.Load())
+	if node.credUntil.Load() != 0 || node.probeNextAt.Load() != 0 {
+		t.Fatalf("a successful probe must clear the quarantine, got cred=%d probeNext=%d",
+			node.credUntil.Load(), node.probeNextAt.Load())
+	}
+	if until := node.cooldownUntil.Load(); until != 0 && time.Unix(0, until).After(time.Now().Add(time.Minute)) {
+		t.Fatalf("any post-probe cooldown must be at most the probation stretch, got %v",
+			time.Until(time.Unix(0, until)))
 	}
 	status, body = postChat(t, g.Handler(), "deepseek-v4.1-flash-free")
 	if status != http.StatusOK || !strings.Contains(body, `"content":"OK"`) {

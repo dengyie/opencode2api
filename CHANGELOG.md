@@ -4,6 +4,42 @@ All notable changes to this maintained edition are documented here. The
 upstream project (jasonxu114514/opencode2api) has its own release notes; this
 file tracks what this repository adds on top of the imported baseline.
 
+## v1.8.1 (2026-11-18) — mid-request quota-wall fast fail + probe-recovery probation
+
+Two traffic-shape optimizations for the free-tier 429 wall, from the 11-17
+production log review (30×499 long-tail, 83×429 averaging 20–80s,
+151 probe recoveries per day re-walled within minutes).
+
+### Added
+
+- **Mid-request wall fast fail** (`internal/gateway/upstream.go`,
+  `internal/gateway/abuse.go`): the entry pre-check runs once, but a walk that
+  starts on a usable key used to keep rotating onto "earliest-cooling"
+  fallback keys after each new 429, burning 1.7–26s per leg until MaxAttempts.
+  Now, right after a 429 walls a key mid-walk, the walk re-checks the
+  read-only `quotaWall()` snapshot; when every configured key plus the
+  anonymous lane are walled, it stops immediately
+  (`quota_wall_fast_fail` event) and the handler synthesizes the same
+  429 + Retry-After + `insufficient_quota` the pre-check would have produced
+  (`quota_wall_midrequest_blocked`), with telemetry outcome
+  `quota_wall_fast_fail`.
+- **Probe-recovery probation** (`internal/gateway/pool.go`,
+  `internal/gateway/quotaprobe.go`): a key the quota probe just recovered
+  went straight back to the head of rotation, where hot traffic re-walled it
+  within minutes — the 429↔recovered churn. `MarkProbation` now applies a
+  soft demotion for `performance.probation_cooldown_seconds` (default 60,
+  0 = off): it sets only `cooldownUntil`, so the cursor prefers any
+  not-recently-recovered peer, while `quotaUntil` stays untouched and the
+  quota pre-check keeps seeing the key as available (a single-key pool still
+  serves through the earliest-cooling fallback). An inference success clears
+  it immediately, and it never shortens an existing cooldown.
+
+### Fixed
+
+- `TestE2EQuotaProbeRecoversKey` / `TestE2EQuotaPrecheckAnonymousRoute` /
+  `TestE2ECredentialQuarantineLoop` assertions updated for the probation
+  cooldown and the walk shortening (both are the intended new behavior).
+
 ## v1.8.0 (2026-11-18) — automatic eviction of credential-dead keys
 
 A key the upstream keeps rejecting with 401/403 (a dead credential) now

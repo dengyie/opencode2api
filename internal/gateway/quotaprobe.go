@@ -143,6 +143,12 @@ func (g *Gateway) probeQuotaKey(ctx context.Context, nodes *upstreamNodes, node 
 	}
 	if result.success {
 		nodes.MarkSuccess(node)
+		// Probation (v1.8.1): demote the recovered key in the selection
+		// cursor for a short stretch so the burst that walled it does not
+		// re-wall it within seconds. Zero keeps the pre-v1.8.1 behavior.
+		if d := time.Duration(g.cfg.Performance.ProbationCooldownSeconds) * time.Second; d > 0 {
+			nodes.MarkProbation(node, d)
+		}
 		// The probe itself is an observation of the model's real behavior:
 		// feed the reasoning-learning map (v1.5.4).
 		g.noteReasoningObservation(model, result.sawReasoning)

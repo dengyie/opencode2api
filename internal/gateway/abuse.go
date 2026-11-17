@@ -157,6 +157,14 @@ const geoBlockedMessage = "the upstream does not offer this model in the region 
 // synthesizes a 503 with the earliest quarantine expiry instead.
 var errKeyCredentialsExhausted = errors.New("upstream keys failed credential validation")
 
+// errKeyQuotaExhausted (v1.8.1) reports that a key attempt during the walk
+// was quota-walled (429) and the re-check confirmed the request's possible
+// lanes are now all quota-cooled — the same judgment the entry pre-check
+// makes, but taken mid-request once the last usable key went walled. The
+// handler synthesizes the same 429+Retry-After as the pre-check instead of
+// letting the cursor burn attempts on keys the Retry-After already describes.
+var errKeyQuotaExhausted = errors.New("all upstream keys became quota-cooled mid-request")
+
 // keyPoolCredentialExhaustedMessage is what a client receives when every key
 // is credential-quarantined (v1.7.0). It names the cause and the recovery
 // path so the caller knows the 503 is transient — the probe loop re-tests

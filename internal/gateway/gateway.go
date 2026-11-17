@@ -574,6 +574,27 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, http.StatusServiceUnavailable, keyPoolCredentialExhaustedMessage, "key_pool_credential_exhausted", ids.Request)
 				return
 			}
+			// Quota-wall fast fail (v1.8.1): the walk noticed mid-request that
+			// every lane went quota-cooled. Same 429 as the entry pre-check —
+			// the OpenAI-canonical insufficient_quota type is what clients key
+			// their no-retry logic on — but with the outcome tagged so the
+			// telemetry separates the fast fail from a full-length walk.
+			if errors.Is(err, errKeyQuotaExhausted) {
+				if meta != nil {
+					meta.Outcome = "quota_wall_fast_fail"
+				}
+				retryAfter := 1
+				if until, walled := g.quotaWall(); walled {
+					retryAfter = int((time.Until(until) + time.Second - 1) / time.Second)
+					if retryAfter < 1 {
+						retryAfter = 1
+					}
+					w.Header().Set("Retry-After", fmt.Sprint(retryAfter))
+				}
+				wire.WriteError(w, external, http.StatusTooManyRequests, "all configured upstream keys are quota-cooled (free usage limit); the gateway probes the window every quota_probe_seconds", "insufficient_quota", ids.Request)
+				g.logger.Warn("request rejected by the mid-request quota wall check", "component", "gateway", "event", "quota_wall_midrequest_blocked", "code", "free_usage_limit", "request_id", ids.Request, "model", model, "tier", finalTier, "retry_after", retryAfter)
+				return
+			}
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}

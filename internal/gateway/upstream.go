@@ -323,6 +323,15 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			}
 			lastResponse = resp
 		}
+		if errors.Is(err, errKeyQuotaExhausted) {
+			// Quota-wall fast fail (v1.8.1): the tier's own walk already
+			// confirmed every lane is quota-cooled — the next tier is walled
+			// by the same judgment, so hand the sentinel straight up.
+			if lastResponse != nil {
+				httpx.DrainAndClose(lastResponse.Body)
+			}
+			return nil, effectiveRoute, attempts, errKeyQuotaExhausted
+		}
 		if err != nil {
 			if errors.Is(err, errKeyCredentialsExhausted) {
 				credExhausted = true
@@ -1061,6 +1070,27 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			g.observeKeyResult(ctx, nodes, node, proxy, resp, err)
 		}
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, recordProxy, resp, err, attemptDuration)
+		// Quota-wall fast fail (v1.8.1): a 429 just walled this key, and the
+		// cursor would keep rotating into the remaining keys — each walled leg
+		// costs 1.7–26s in production and ends past the caller's first-token
+		// gate anyway. Re-run the entry pre-check's judgment (read-only, O(#keys)):
+		// if the anonymous lane cannot take the request and every configured tier
+		// is quota-cooled, stop burning legs and let the handler synthesize the
+		// same 429+Retry-After the pre-check would have.
+		if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+			if until, walled := g.quotaWall(); walled {
+				retryAfter := int((time.Until(until) + time.Second - 1) / time.Second)
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				g.logger.Warn("key tier went quota-walled mid-request; cutting the walk short", "component", "upstream", "event", "quota_wall_fast_fail", "request_id", ids.Request, "attempts", attempts, "tier", route.Tier, "key_id", keyID, "retry_after", retryAfter)
+				if lastResponse != nil {
+					httpx.DrainAndClose(lastResponse.Body)
+				}
+				httpx.DrainAndClose(resp.Body)
+				return nil, errKeyQuotaExhausted, attempts
+			}
+		}
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", proxyLabel, "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
